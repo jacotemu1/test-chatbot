@@ -1,0 +1,26 @@
+{
+  "name": "chatbot-stress-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable TypeScript stress and robustness test harness for chatbot APIs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "playwright test",
+    "test:smoke": "SCENARIO_FILTER=smoke playwright test tests/chatbot.spec.ts -g \"Smoke\"",
+    "test:profile:light": "CHATBOT_PROFILE=light playwright test",
+    "test:profile:medium": "CHATBOT_PROFILE=medium playwright test",
+    "test:profile:heavy": "CHATBOT_PROFILE=heavy playwright test",
+    "test:profile:breakpoint": "CHATBOT_PROFILE=breakpoint playwright test",
+    "report:show": "playwright show-report"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "dotenv": "^16.5.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.0",
+    "@types/node": "^22.15.17",
+    "typescript": "^5.8.3"
+  }
+}
