@@ -1,0 +1,42 @@
+name: Chatbot Stress Harness
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Stress profile"
+        required: true
+        default: "light"
+        type: choice
+        options:
+          - light
+          - medium
+          - heavy
+          - breakpoint
+
+jobs:
+  stress-test:
+    runs-on: ubuntu-latest
+    env:
+      CHATBOT_PROFILE: ${{ github.event.inputs.profile }}
+      CHATBOT_URL: ${{ secrets.CHATBOT_URL }}
+      CHATBOT_AUTH_TOKEN: ${{ secrets.CHATBOT_AUTH_TOKEN }}
+      CHATBOT_TIMEOUT_MS: ${{ vars.CHATBOT_TIMEOUT_MS || '15000' }}
+      CHATBOT_MAX_CONCURRENCY: ${{ vars.CHATBOT_MAX_CONCURRENCY || '8' }}
+      CHATBOT_RAMP_STEPS: ${{ vars.CHATBOT_RAMP_STEPS || '6' }}
+      CHATBOT_TOTAL_REQUESTS: ${{ vars.CHATBOT_TOTAL_REQUESTS || '100' }}
+      CHATBOT_OUTPUT_DIR: reports
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chatbot-stress-${{ github.run_id }}
+          path: reports/
