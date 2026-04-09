@@ -199,7 +199,12 @@ This endpoint is internal and usually unreachable from GitHub-hosted runners. Us
 - a **self-hosted runner** on corporate network, or
 - a VPN/private network route from CI.
 
-The included GitHub Action is `workflow_dispatch`-only and uploads artifacts even on failures.
+Workflows included:
+- `smoke-tests.yml` (quick PR-safe low-traffic checks)
+- `stress-tests.yml` (manual dispatch with profile input: light/medium/heavy/breakpoint)
+- `nightly.yml` (scheduled medium profile + regression comparison with previous run)
+
+All workflows keep artifact upload `always()` and can be switched to self-hosted by setting repository variable `CHATBOT_RUNNER=self-hosted` (or dispatch input `runner=self-hosted`).
 
 ## Design choices (brief)
 - Playwright provides mature assertions + JUnit/HTML/JSON reporters out-of-the-box.
