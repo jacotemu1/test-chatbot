@@ -28,6 +28,18 @@ export interface HarnessConfig {
   outputDir: string;
   profile: Profile;
   breakpointThresholds: BreakpointThresholds;
+  ui: {
+    url?: string;
+    agentSelector?: string;
+    agentOptionText?: string;
+    localeSelector?: string;
+    localeOptionText?: string;
+    newSessionSelector?: string;
+    inputSelector?: string;
+    sendButtonSelector?: string;
+    responseSelector?: string;
+    conversationPanelSelector?: string;
+  };
 }
 
 export interface ChatPayload {

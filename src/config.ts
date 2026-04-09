@@ -40,5 +40,17 @@ export function loadConfig(): HarnessConfig {
       maxEmptyResponseRate: toRatio(process.env.CHATBOT_BREAKPOINT_MAX_EMPTY_RATE, 0.05),
       maxSchemaDriftRate: toRatio(process.env.CHATBOT_BREAKPOINT_MAX_SCHEMA_DRIFT_RATE, 0.05),
     },
+    ui: {
+      url: process.env.CHATBOT_UI_URL,
+      agentSelector: process.env.CHATBOT_AGENT_SELECTOR,
+      agentOptionText: process.env.CHATBOT_AGENT_OPTION_TEXT,
+      localeSelector: process.env.CHATBOT_LOCALE_SELECTOR,
+      localeOptionText: process.env.CHATBOT_LOCALE_OPTION_TEXT,
+      newSessionSelector: process.env.CHATBOT_NEW_SESSION_SELECTOR,
+      inputSelector: process.env.CHATBOT_INPUT_SELECTOR,
+      sendButtonSelector: process.env.CHATBOT_SEND_BUTTON_SELECTOR,
+      responseSelector: process.env.CHATBOT_RESPONSE_SELECTOR,
+      conversationPanelSelector: process.env.CHATBOT_CONVERSATION_PANEL_SELECTOR,
+    },
   };
 }
