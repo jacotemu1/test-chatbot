@@ -116,6 +116,28 @@ npm ci
 npm test
 ```
 
+
+### Breakpoint discovery mode (automated)
+When `CHATBOT_PROFILE=breakpoint`, the runner automatically:
+1. starts from low concurrency
+2. increases concurrency step-by-step
+3. executes enough requests per step (>=50)
+4. checks SLA thresholds per step
+5. stops at first unstable step
+6. estimates safe operating range
+
+Configurable SLA thresholds (env):
+- `CHATBOT_BREAKPOINT_MAX_P95_MS`
+- `CHATBOT_BREAKPOINT_MAX_TIMEOUT_RATE`
+- `CHATBOT_BREAKPOINT_MAX_ERROR_RATE`
+- `CHATBOT_BREAKPOINT_MAX_EMPTY_RATE`
+- `CHATBOT_BREAKPOINT_MAX_SCHEMA_DRIFT_RATE`
+
+Generated breakpoint artifacts:
+- `breakpoint-summary.json`
+- `breakpoint-steps.json`
+- `breakpoint-summary.md` (human interpretation with healthy/degrading/unreliable zones)
+
 ## Stress profiles
 - `light` – quick signal
 - `medium` – balanced
@@ -143,6 +165,9 @@ Generated in `CHATBOT_OUTPUT_DIR` (default `reports/`):
 - `playwright-report.json`
 - `playwright-html/`
 - `report.html` (human-readable scenario table)
+- `breakpoint-summary.json` (best stable / first unstable / thresholds)
+- `breakpoint-steps.json` (per-step metrics table source)
+- `breakpoint-summary.md` (human interpretation)
 
 ## CI notes (internal endpoint)
 This endpoint is internal and usually unreachable from GitHub-hosted runners. Use:

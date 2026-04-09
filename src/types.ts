@@ -10,6 +10,14 @@ export type ValidationMode =
 
 export type ScoreLabel = 'pass' | 'warn' | 'fail';
 
+export interface BreakpointThresholds {
+  maxP95LatencyMs: number;
+  maxTimeoutRate: number;
+  maxErrorRate: number;
+  maxEmptyResponseRate: number;
+  maxSchemaDriftRate: number;
+}
+
 export interface HarnessConfig {
   chatbotUrl: string;
   authToken?: string;
@@ -19,6 +27,7 @@ export interface HarnessConfig {
   totalRequests: number;
   outputDir: string;
   profile: Profile;
+  breakpointThresholds: BreakpointThresholds;
 }
 
 export interface ChatPayload {
@@ -101,4 +110,16 @@ export interface ScenarioMetrics {
   answerLengthAvg: number;
   failures: number;
   warns: number;
+}
+
+export interface BreakpointStepMetrics {
+  concurrency: number;
+  total: number;
+  p95LatencyMs: number;
+  timeoutRate: number;
+  errorRate: number;
+  emptyResponseRate: number;
+  schemaDriftRate: number;
+  healthy: boolean;
+  violations: string[];
 }
