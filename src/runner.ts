@@ -236,6 +236,188 @@ function writeConversationMarkdown(outputDir: string, items: ConversationRunMetr
   fs.writeFileSync(path.join(outputDir, 'conversation-summary.md'), md, 'utf8');
 }
 
+function buildDashboardHtml(data: unknown): string {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Chatbot Stress Dashboard</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:20px;background:#fafafa;color:#111}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+    .card{background:#fff;padding:12px;border:1px solid #ddd;border-radius:8px}
+    table{width:100%;border-collapse:collapse;background:#fff;margin:10px 0}
+    th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:13px}
+    th{background:#f1f1f1}
+    h2{margin-top:24px}
+    .muted{color:#666;font-size:12px}
+    .bar{height:8px;background:#e6e6e6;border-radius:4px;overflow:hidden}
+    .fill{height:100%;background:#db3b3b}
+    details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;margin:8px 0}
+    code{white-space:pre-wrap;display:block}
+  </style>
+</head>
+<body>
+  <h1>Chatbot Stress Dashboard</h1>
+  <div id="app"></div>
+  <script>
+    const data = ${JSON.stringify(data)};
+
+    function pct(v){ return (v*100).toFixed(2)+'%'; }
+    function esc(s){ return String(s ?? ''); }
+
+    const app = document.getElementById('app');
+    const cards = [
+      ['Total requests', data.summary?.totals?.total ?? 0],
+      ['Success rate', pct(data.summary?.successRate ?? 0)],
+      ['Hard failures', data.summary?.totals?.failures ?? 0],
+      ['Timeouts', data.summary?.totals?.timeouts ?? 0],
+      ['Warns', data.summary?.totals?.warns ?? 0],
+      ['Scenarios', data.summary?.scenarios ?? 0],
+    ];
+
+    let trendHtml = '<p class="muted">No previous run baseline found.</p>';
+    if (data.previousSummary) {
+      const srDelta = (data.summary.successRate - data.previousSummary.successRate) * 100;
+      trendHtml = `<p><b>Trend vs previous:</b> Success rate delta: ${srDelta.toFixed(2)} pp</p>`;
+    }
+
+    const latency = data.latency;
+
+    const errorRows = (data.scenarioMetrics || []).map(m => {
+      const total = Math.max(1, m.total);
+      const failRate = m.failures / total;
+      return `<tr>
+        <td>${esc(m.name)}</td>
+        <td>${m.total}</td>
+        <td>${m.failures}</td>
+        <td>${m.timeoutCount}</td>
+        <td>${m.non200Count}</td>
+        <td>${m.schemaDriftCount}</td>
+        <td>${pct(failRate)}</td>
+      </tr>`;
+    }).join('');
+
+    const worstRows = (data.worstScenarios || []).map(w => {
+      const total = Math.max(1, w.total);
+      const failRate = w.failures / total;
+      return `<tr>
+        <td>${esc(w.name)}</td>
+        <td>${w.failures}/${w.total}</td>
+        <td><div class="bar"><div class="fill" style="width:${Math.min(100, failRate*100)}%"></div></div> ${pct(failRate)}</td>
+      </tr>`;
+    }).join('');
+
+    const suspiciousRows = (data.suspicious || []).map(x => `<tr><td>${esc(x.scenario)}</td><td>${esc(x.score)}</td><td>${esc(x.reason)}</td><td>${esc(x.excerpt)}</td></tr>`).join('');
+
+    const concurrencyRows = (data.concurrencyVsFailure || []).map(x => `<tr><td>${x.concurrency}</td><td>${pct(x.failureRate)}</td><td>${esc(x.status)}</td></tr>`).join('');
+
+    const artifactLinks = (data.artifactLinks || []).map(x => `<li><a href="${x.href}">${x.name}</a></li>`).join('');
+
+    app.innerHTML = `
+      <div class="cards">${cards.map(c=>`<div class="card"><div class="muted">${c[0]}</div><div><b>${c[1]}</b></div></div>`).join('')}</div>
+      ${trendHtml}
+
+      <h2>Latency percentiles</h2>
+      <table><tr><th>p50</th><th>p95</th><th>p99</th></tr><tr><td>${latency.p50}</td><td>${latency.p95}</td><td>${latency.p99}</td></tr></table>
+
+      <h2>Error breakdown by scenario</h2>
+      <table><tr><th>Scenario</th><th>Total</th><th>Failures</th><th>Timeouts</th><th>Non-200</th><th>Schema drift</th><th>Failure rate</th></tr>${errorRows}</table>
+
+      <h2>Concurrency vs failure rate</h2>
+      <table><tr><th>Concurrency</th><th>Failure rate</th><th>Status</th></tr>${concurrencyRows || '<tr><td colspan="3">Available after breakpoint profile run.</td></tr>'}</table>
+
+      <h2>Worst scenarios</h2>
+      <table><tr><th>Scenario</th><th>Failures</th><th>Rate</th></tr>${worstRows}</table>
+
+      <h2>Suspicious outputs</h2>
+      <table><tr><th>Scenario</th><th>Score</th><th>Reason</th><th>Excerpt</th></tr>${suspiciousRows || '<tr><td colspan="4">No suspicious outputs captured.</td></tr>'}</table>
+
+      <h2>Artifacts</h2>
+      <ul>${artifactLinks}</ul>
+
+      <h2>Embedded excerpts</h2>
+      <details><summary>summary.json</summary><code>${esc(JSON.stringify(data.summary, null, 2))}</code></details>
+      <details><summary>first suspicious record</summary><code>${esc(JSON.stringify((data.suspiciousRaw||[])[0] || {}, null, 2))}</code></details>
+    `;
+  </script>
+</body>
+</html>`;
+}
+
+function writeDashboard(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], breakpointSteps: BreakpointStepMetrics[]): void {
+  const previousSummaryPath = path.join(outputDir, 'previous-summary.json');
+  const previousSummary = fs.existsSync(previousSummaryPath)
+    ? JSON.parse(fs.readFileSync(previousSummaryPath, 'utf8'))
+    : null;
+
+  const failuresPath = path.join(outputDir, 'failures.jsonl');
+  const failureRows = fs.existsSync(failuresPath)
+    ? fs.readFileSync(failuresPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    : [];
+
+  const suspicious = failureRows
+    .filter((x) => x.validation?.suspiciousReason || (x.validation?.suspiciousSignals || []).length > 0)
+    .slice(0, 15)
+    .map((x) => ({
+      scenario: x.scenario,
+      score: x.score,
+      reason: x.validation?.suspiciousReason || (x.validation?.suspiciousSignals || []).join('; '),
+      excerpt: String(x.rawBody || '').slice(0, 200),
+    }));
+
+  const weighted = scenarioMetrics.reduce((acc, m) => {
+    acc.total += m.total;
+    acc.p50 += m.p50 * m.total;
+    acc.p95 += m.p95 * m.total;
+    acc.p99 += m.p99 * m.total;
+    return acc;
+  }, { total: 0, p50: 0, p95: 0, p99: 0 });
+
+  const latency = weighted.total
+    ? {
+        p50: Math.round(weighted.p50 / weighted.total),
+        p95: Math.round(weighted.p95 / weighted.total),
+        p99: Math.round(weighted.p99 / weighted.total),
+      }
+    : { p50: 0, p95: 0, p99: 0 };
+
+  const worstScenarios = [...scenarioMetrics]
+    .sort((a, b) => (b.failures / Math.max(1, b.total)) - (a.failures / Math.max(1, a.total)))
+    .slice(0, 5);
+
+  const concurrencyVsFailure = breakpointSteps.map((s) => ({
+    concurrency: s.concurrency,
+    failureRate: s.timeoutRate + s.errorRate + s.emptyResponseRate + s.schemaDriftRate,
+    status: s.healthy ? 'Healthy' : 'Unstable',
+  }));
+
+  const artifactLinks = [
+    'summary.json',
+    'scenario-metrics.json',
+    'conversation-metrics.json',
+    'failures.jsonl',
+    'report.html',
+    'conversation-summary.md',
+    'breakpoint-summary.json',
+    'breakpoint-summary.md',
+  ].map((name) => ({ name, href: name }));
+
+  const dashboardData = {
+    summary,
+    previousSummary,
+    latency,
+    scenarioMetrics,
+    worstScenarios,
+    suspicious,
+    suspiciousRaw: failureRows,
+    concurrencyVsFailure,
+    artifactLinks,
+  };
+
+  fs.writeFileSync(path.join(outputDir, 'dashboard.html'), buildDashboardHtml(dashboardData), 'utf8');
+}
+
 function evaluateBreakpointStep(metrics: ScenarioMetrics, concurrency: number, config: HarnessConfig): BreakpointStepMetrics {
   const total = Math.max(1, metrics.total);
   const timeoutRate = metrics.timeoutCount / total;
@@ -405,6 +587,7 @@ export async function runHarness(): Promise<void> {
   writeCsv(config.outputDir, metrics);
   writeHumanHtml(config.outputDir, summary, metrics);
   writeConversationMarkdown(config.outputDir, conversationMetrics);
+  writeDashboard(config.outputDir, summary, metrics, breakpoint.steps);
 
   if (breakpoint.steps.length) {
     writeJson(path.join(config.outputDir, 'breakpoint-summary.json'), breakpoint);
@@ -421,6 +604,7 @@ export async function runHarness(): Promise<void> {
   console.log(`Timeouts: ${summary.totals.timeouts}`);
   console.log(`Non-200: ${summary.totals.non200}`);
   console.log(`Conversation scenarios: ${conversationMetrics.length}`);
+  console.log(`Dashboard: ${path.join(config.outputDir, 'dashboard.html')}`);
 
   if (breakpoint.steps.length) {
     console.log('=== Breakpoint Discovery ===');

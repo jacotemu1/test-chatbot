@@ -178,6 +178,20 @@ npm run test:profile:breakpoint
 
 Breakpoint search increases concurrency stepwise and records where success rate drops below 95% or p95 exceeds 2500ms.
 
+
+## Lightweight report viewer
+After each run, the harness generates `dashboard.html` (static, no backend) with:
+- summary cards
+- latency percentile section
+- error breakdown by scenario
+- concurrency vs failure rate (when breakpoint data exists)
+- suspicious outputs table
+- worst scenarios ranking
+- artifact links + embedded JSON excerpts
+- basic trend indicator when `previous-summary.json` is available
+
+Open directly from disk or CI artifact bundle.
+
 ## Output artifacts
 Generated in `CHATBOT_OUTPUT_DIR` (default `reports/`):
 - `summary.json`
@@ -188,6 +202,7 @@ Generated in `CHATBOT_OUTPUT_DIR` (default `reports/`):
 - `playwright-report.json`
 - `playwright-html/`
 - `report.html` (human-readable scenario table)
+- `dashboard.html` (lightweight static viewer)
 - `conversation-metrics.json` (turn-level and session-level conversation metrics)
 - `conversation-summary.md` (human interpretation for conversation coherence/degradation)
 - `breakpoint-summary.json` (best stable / first unstable / thresholds)

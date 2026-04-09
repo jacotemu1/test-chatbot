@@ -39,10 +39,12 @@ test.describe('Chatbot robustness harness', () => {
     const scenarioPath = path.join(config.outputDir, 'scenario-metrics.json');
     const failuresPath = path.join(config.outputDir, 'failures.jsonl');
     const conversationMetricsPath = path.join(config.outputDir, 'conversation-metrics.json');
+    const dashboardPath = path.join(config.outputDir, 'dashboard.html');
 
     expect(fs.existsSync(summaryPath)).toBeTruthy();
     expect(fs.existsSync(scenarioPath)).toBeTruthy();
     expect(fs.existsSync(conversationMetricsPath)).toBeTruthy();
+    expect(fs.existsSync(dashboardPath)).toBeTruthy();
 
     const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8')) as {
       successRate: number;
