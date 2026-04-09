@@ -288,6 +288,34 @@ function buildTechnicalReport(outputDir: string, examples: Transcript[], bucketC
   fs.writeFileSync(path.join(outputDir, 'report', 'technical.html'), html, 'utf8');
 }
 
+function classifyHumanOutcome(t: Transcript): { outcome: string; problem: string; severity: 'Low'|'Medium'|'High'|'Critical'; impact: string } {
+  if (t.failureBucket === 'endpoint_unreachable' || t.failureBucket === 'dns_or_network_failure' || t.failureBucket === 'auth_failure' || t.failureBucket === 'non_200_http_response') {
+    return { outcome: 'Technical failure', problem: 'Technical configuration issue', severity: 'Critical', impact: 'Lost purchase opportunity' };
+  }
+  if (t.failureBucket === 'empty_body' || t.failureBucket === 'empty_answer_field') {
+    return { outcome: 'No response', problem: 'Did not answer', severity: 'Critical', impact: 'Lost purchase opportunity' };
+  }
+  if (t.issues.includes('hallucinated_fitment')) {
+    return { outcome: 'Wrong answer', problem: 'Unsafe fitment guidance risk', severity: 'High', impact: 'Fitment risk' };
+  }
+  if (t.issues.includes('missing_clarification')) {
+    return { outcome: 'Off-track', problem: 'Did not ask needed fitment questions', severity: 'High', impact: 'User confusion' };
+  }
+  if (t.issues.includes('no_cta_or_next_step')) {
+    return { outcome: 'Worked but weak', problem: 'Did not guide toward purchase', severity: 'High', impact: 'Low commercial effectiveness' };
+  }
+  if (t.latencyMs > 4000) {
+    return { outcome: 'Slow', problem: 'Response was too slow', severity: 'Medium', impact: 'Slow journey progression' };
+  }
+  if (t.issues.includes('generic_non_answer')) {
+    return { outcome: 'Worked but weak', problem: 'Too generic', severity: 'Medium', impact: 'Trust loss' };
+  }
+  if (t.result === 'warn') {
+    return { outcome: 'Worked but weak', problem: 'Partially useful response', severity: 'Medium', impact: 'User confusion' };
+  }
+  return { outcome: 'Worked', problem: 'No major issue', severity: 'Low', impact: 'No significant business impact' };
+}
+
 function buildMainReport(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], sales: Record<string, number>, transcripts: Transcript[], screenshots: string[], bucketCounts: Record<string, number>): void {
   const reportDir = path.join(outputDir, 'report');
   ensureDir(reportDir);
@@ -298,23 +326,80 @@ function buildMainReport(outputDir: string, summary: ReturnType<typeof aggregate
   const qualityFails = transcripts.filter((t) => t.failureBucket === 'chatbot_quality_failure');
 
   const evidenceRows = transcripts.slice(0, 120).map((t) => {
+    const human = classifyHumanOutcome(t);
     const shot = screenshots.find((s) => path.basename(s).startsWith(t.id));
     const shotLink = shot ? `<a href="../screenshots/${path.basename(shot)}">screenshot</a>` : '-';
-    return `<tr><td>${t.scenarioId}</td><td>${t.prompt.slice(0,120)}</td><td>${t.status ?? 'n/a'}</td><td>${t.answer.length}</td><td>${t.failureBucket ?? 'none'}</td><td>${t.reason}</td><td><a href="../conversations/${t.id}.html">transcript</a></td><td>${shotLink}</td></tr>`;
+    return `<tr><td>${t.scenarioId}</td><td>${t.prompt.slice(0,120)}</td><td>${t.answer.slice(0,120) || '[empty]'}</td><td>${human.outcome}</td><td>${human.problem}</td><td><span class="sev ${human.severity.toLowerCase()}">${human.severity}</span></td><td>${shotLink}</td><td><a href="../conversations/${t.id}.html">details</a></td></tr>`;
   }).join('');
 
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Investigation Report</title><style>body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px;vertical-align:top}</style></head><body>
-  <h1>Chatbot Investigation Report</h1>
-  <p>Success ${(summary.successRate*100).toFixed(2)}% | Warn ${summary.totals.warns} | Fail ${summary.totals.failures}</p>
+  const worstCases = transcripts
+    .filter((t) => t.result !== 'pass')
+    .map((t) => ({ t, human: classifyHumanOutcome(t) }))
+    .sort((a, b) => {
+      const order = { Critical: 4, High: 3, Medium: 2, Low: 1 } as Record<string, number>;
+      return order[b.human.severity] - order[a.human.severity];
+    })
+    .slice(0, 10);
+
+  const worstRows = worstCases.map(({ t, human }) => {
+    const shot = screenshots.find((s) => path.basename(s).startsWith(t.id));
+    const thumb = shot ? `<img src="../screenshots/${path.basename(shot)}" style="width:220px;border:1px solid #ccc" />` : '';
+    return `<tr><td>${t.prompt}</td><td>${t.answer || '[empty]'}</td><td>${human.problem}</td><td>${human.impact}</td><td>${thumb}</td><td><a href="../conversations/${t.id}.html">transcript</a></td></tr>`;
+  }).join('');
+
+  const screenshotCards = worstCases.map(({ t, human }) => {
+    const shot = screenshots.find((s) => path.basename(s).startsWith(t.id));
+    if (!shot) return '';
+    return `<div class="card"><img src="../screenshots/${path.basename(shot)}" style="width:100%" /><p><b>${t.scenarioId}</b></p><p>${human.problem}</p><p><a href="../conversations/${t.id}.html">Open conversation</a></p></div>`;
+  }).join('');
+
+  const qualityValid = technicalCount / total < 0.6;
+  const overall = !qualityValid ? 'FAIL' : summary.successRate >= 0.8 ? 'PASS' : summary.successRate >= 0.5 ? 'WARNING' : 'FAIL';
+  const oneLine = !qualityValid
+    ? 'The run is not valid for quality evaluation because endpoint/integration failures dominate.'
+    : summary.successRate >= 0.8
+      ? 'The chatbot responded correctly in most scenarios, with limited weak spots.'
+      : 'The chatbot is reachable, but multiple fitment and commercial guidance failures were detected.';
+
+  const keyFindings = [
+    `Chatbot ${qualityValid ? 'worked with partial weaknesses' : 'did not provide enough usable answers for quality judgment'}.`,
+    `Fitment clarification rate: ${(sales.fitmentClarificationRate * 100).toFixed(1)}%.`,
+    `CTA presence rate: ${(sales.ctaPresenceRate * 100).toFixed(1)}%.`,
+    `No/empty response technical buckets: ${(bucketCounts.empty_body ?? 0) + (bucketCounts.empty_answer_field ?? 0)} cases.`,
+    `Technical failures: ${technicalCount}/${total}.`,
+  ].slice(0, 5);
+
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Executive Summary</title><style>body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px;vertical-align:top}.cards{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px}.panel{border:1px solid #ddd;padding:10px;border-radius:8px}.sev{padding:2px 6px;border-radius:6px;color:#fff}.low{background:#2f855a}.medium{background:#d69e2e}.high{background:#dd6b20}.critical{background:#c53030}.gallery{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:12px}.card{border:1px solid #ddd;padding:8px;border-radius:8px}</style></head><body>
+  <h1>Executive Investigation Summary</h1>
+  <div class="cards">
+    <div class="panel"><b>Run valid for quality evaluation</b><br>${qualityValid ? 'YES' : 'NO'}</div>
+    <div class="panel"><b>Overall result</b><br>${overall}</div>
+    <div class="panel"><b>Success rate</b><br>${(summary.successRate*100).toFixed(2)}%</div>
+    <div class="panel"><b>One-line explanation</b><br>${oneLine}</div>
+  </div>
+  <h2>High-level verdict</h2>
+  <p>The chatbot ${qualityValid ? 'was reachable for quality review' : 'was mostly blocked by technical failures'}, ${sales.contradictionRate > 0.1 ? 'showed consistency issues' : 'was reasonably consistent in available answers'}, and ${sales.ctaPresenceRate > 0.5 ? 'often moved users toward next commercial steps' : 'often failed to provide click-to-buy progression'}.</p>
+  <h2>Key findings</h2>
+  <ul>${keyFindings.map((k) => `<li>${k}</li>`).join('')}</ul>
   <h2>System / endpoint failures</h2><p>${technicalCount}/${total} conversations are technical failures.</p><pre>${JSON.stringify(bucketCounts, null, 2)}</pre>
   <h2>Empty or unusable responses</h2><p>${unusableCount}/${total} conversations have empty body/answer.</p>
   <h2>Real chatbot misunderstandings</h2><p>${qualityFails.filter((t)=>t.issues.includes('misunderstood_intent')).length} detected with valid answers.</p>
   <h2>Commercial failures with valid answers</h2><p>No CTA rate ${(sales.noCtaRate*100).toFixed(2)}%, purchase guidance ${(sales.purchaseGuidanceRate*100).toFixed(2)}%.</p>
   <h2>Fitment failures with valid answers</h2><p>Fitment clarification ${(sales.fitmentClarificationRate*100).toFixed(2)}%, unsafe fitment ${(sales.unsafeFitmentRate*100).toFixed(2)}%.</p>
-  <h2>Evidence table</h2>
-  <table><tr><th>Scenario</th><th>Prompt</th><th>HTTP status</th><th>Answer length</th><th>Failure bucket</th><th>Short reason</th><th>Transcript</th><th>Screenshot</th></tr>${evidenceRows}</table>
+  <h2>Scenario breakdown table</h2>
+  <table><tr><th>Scenario</th><th>User request</th><th>Bot response preview</th><th>Outcome</th><th>Problem detected</th><th>Severity</th><th>Screenshot</th><th>Details link</th></tr>${evidenceRows}</table>
+  <h2>Worst cases (Top 10)</h2>
+  <table><tr><th>Prompt</th><th>Full answer</th><th>Why problematic</th><th>Business impact</th><th>Screenshot</th><th>Transcript</th></tr>${worstRows}</table>
+  <h2>Screenshot-first investigation</h2>
+  <div class="gallery">${screenshotCards || '<p>No screenshots available.</p>'}</div>
+  <h2>Where the chatbot helps the user correctly</h2><p>Scenarios marked as “Worked” with low severity in the breakdown table.</p>
+  <h2>Where the chatbot gets confused</h2><p>Cases tagged misunderstood_intent, irrelevant_answer, contradiction, or generic_non_answer.</p>
+  <h2>Where the chatbot fails commercially</h2><p>Cases with no CTA/next step and weak purchase guidance.</p>
+  <h2>Where the chatbot does not behave like a tyre dealer</h2><p>Cases missing fitment clarification or showing generic advice without dealership-style progression.</p>
+  <h2>Where the chatbot is too slow or unstable</h2><p>Cases with slow outcomes and technical timeouts/non-200 status.</p>
   <p><a href="technical.html">Open technical failure report</a></p>
   </body></html>`;
+  fs.writeFileSync(path.join(reportDir, 'executive-summary.html'), html, 'utf8');
   fs.writeFileSync(path.join(reportDir, 'index.html'), html, 'utf8');
 }
 
@@ -443,7 +528,7 @@ export async function runHarness(): Promise<void> {
     '# Chatbot Stress Investigation Summary',
     `- Success rate: ${(summary.successRate*100).toFixed(2)}%`,
     `- Technical dominant failures: ${technicalDominant ? 'YES' : 'NO'}`,
-    `- Main report: report/index.html`,
+    `- Main report: report/executive-summary.html`,
     `- Technical report: report/technical.html`,
     '',
     '## First things to check',
@@ -457,6 +542,6 @@ export async function runHarness(): Promise<void> {
 
   console.log('=== Chatbot Stress Summary ===');
   console.log(`Profile: ${config.profile}`);
-  console.log(`Main report: ${path.join(config.outputDir, 'report/index.html')}`);
+  console.log(`Main report: ${path.join(config.outputDir, 'report/executive-summary.html')}`);
   console.log(`Technical report: ${path.join(config.outputDir, 'report/technical.html')}`);
 }

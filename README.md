@@ -44,7 +44,7 @@ Generated in `reports/`:
 - `sales-metrics.json`
 - `conversation-metrics.json`
 - `failures.jsonl`
-- `report/index.html` (main executive investigation report)
+- `report/executive-summary.html` (main executive investigation report)
 - `conversations/*.json|*.md|*.html` (full transcripts)
 - `screenshots/*.png` (failed/warn + sample pass rendered conversation pages)
 - `top-10-worst-conversations.json`
