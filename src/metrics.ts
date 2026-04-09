@@ -19,7 +19,8 @@ export function computeScenarioMetrics(name: string, rows: EvaluatedResult[]): S
   const parseFailure = rows.filter((x) => x.validation.parseFailure).length;
   const emptyResponse = rows.filter((x) => x.validation.emptyResponse).length;
   const schemaDrift = rows.filter((x) => x.validation.schemaDrift).length;
-  const failures = rows.filter((x) => x.result.error || x.result.timedOut || (x.result.status ?? 500) !== 200).length;
+  const failures = rows.filter((x) => x.validation.score === 'fail' || (x.result.status ?? 500) !== 200 || !!x.result.error).length;
+  const warns = rows.filter((x) => x.validation.score === 'warn').length;
   const successRate = rows.length ? (rows.length - failures) / rows.length : 0;
 
   const answerLengths = rows.map((x) => x.validation.answerText?.length ?? 0);
@@ -46,5 +47,6 @@ export function computeScenarioMetrics(name: string, rows: EvaluatedResult[]): S
     duplicateResponseRatio,
     answerLengthAvg,
     failures,
+    warns,
   };
 }

@@ -1,5 +1,7 @@
 import Ajv from 'ajv';
-import { ChatResult, ValidationOutcome, ValidationRule } from './types';
+import { detectSuspiciousSignals } from './suspiciousDetector';
+import { scoreValidation } from './scoring';
+import { ChatResult, ValidationMode, ValidationOutcome, ValidationRule } from './types';
 
 const ajv = new Ajv({ strict: false, allErrors: true });
 const genericFailurePatterns = [
@@ -31,6 +33,33 @@ function pickAnswer(parsedBody: unknown, answerPath?: string): string {
   return '';
 }
 
+function enforceMode(mode: ValidationMode | undefined, input: {
+  parseFailure: boolean;
+  emptyResponse: boolean;
+  schemaDrift: boolean;
+  keywordMiss: boolean;
+  genericFailureDetected: boolean;
+}): Pick<ValidationOutcome, 'parseFailure' | 'emptyResponse' | 'schemaDrift' | 'keywordMiss' | 'genericFailureDetected'> {
+  if (!mode) return input;
+
+  switch (mode) {
+    case 'latency_only':
+      return { parseFailure: false, emptyResponse: false, schemaDrift: false, keywordMiss: false, genericFailureDetected: false };
+    case 'schema_only':
+      return { ...input, emptyResponse: false, keywordMiss: false, genericFailureDetected: false };
+    case 'safety_check':
+      return { ...input, keywordMiss: false };
+    case 'consistency_check':
+      return input;
+    case 'keyword_match':
+      return input;
+    case 'non_empty':
+      return { ...input, keywordMiss: false, schemaDrift: false };
+    default:
+      return input;
+  }
+}
+
 export function validateResult(result: ChatResult, rule?: ValidationRule): ValidationOutcome {
   const parseFailure = !!(result.rawBody && !result.parsedBody);
   const answerText = pickAnswer(result.parsedBody, rule?.answerPath).trim();
@@ -45,25 +74,40 @@ export function validateResult(result: ChatResult, rule?: ValidationRule): Valid
   let keywordMiss = false;
   if (rule?.expectedKeywords && rule.expectedKeywords.length > 0) {
     const lower = answerText.toLowerCase();
-    keywordMiss = !rule.expectedKeywords.every((k) => lower.includes(k.toLowerCase()));
+    keywordMiss = !rule.expectedKeywords.some((k) => lower.includes(k.toLowerCase()));
   }
 
   const genericFailureDetected = genericFailurePatterns.some((p) => p.test(answerText));
+  const suspiciousSignals = detectSuspiciousSignals(answerText);
 
-  let suspiciousReason: string | undefined;
-  if (parseFailure) suspiciousReason = 'Parse failure';
-  else if (schemaDrift) suspiciousReason = 'Schema drift';
-  else if (keywordMiss) suspiciousReason = 'Keyword mismatch';
-  else if (genericFailureDetected) suspiciousReason = 'Generic refusal/failure';
-  else if (emptyResponse) suspiciousReason = 'Empty response';
-
-  return {
+  const modeAdjusted = enforceMode(rule?.mode, {
     parseFailure,
     emptyResponse,
     schemaDrift,
     keywordMiss,
     genericFailureDetected,
+  });
+
+  let suspiciousReason: string | undefined;
+  if (modeAdjusted.parseFailure) suspiciousReason = 'Parse failure';
+  else if (modeAdjusted.schemaDrift) suspiciousReason = 'Schema drift';
+  else if (modeAdjusted.keywordMiss) suspiciousReason = 'Keyword mismatch';
+  else if (modeAdjusted.genericFailureDetected) suspiciousReason = 'Generic refusal/failure';
+  else if (modeAdjusted.emptyResponse) suspiciousReason = 'Empty response';
+  else if (suspiciousSignals.length > 0) suspiciousReason = suspiciousSignals.join('; ');
+
+  const knownFlakySemantic = !!rule?.flakySemantic;
+
+  const partial: Omit<ValidationOutcome, 'score'> = {
+    ...modeAdjusted,
+    suspiciousSignals,
     answerText,
     suspiciousReason,
+    knownFlakySemantic,
+  };
+
+  return {
+    ...partial,
+    score: scoreValidation(partial),
   };
 }

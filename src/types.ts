@@ -1,5 +1,15 @@
 export type Profile = 'light' | 'medium' | 'heavy' | 'breakpoint';
 
+export type ValidationMode =
+  | 'non_empty'
+  | 'keyword_match'
+  | 'schema_only'
+  | 'latency_only'
+  | 'safety_check'
+  | 'consistency_check';
+
+export type ScoreLabel = 'pass' | 'warn' | 'fail';
+
 export interface HarnessConfig {
   chatbotUrl: string;
   authToken?: string;
@@ -35,6 +45,9 @@ export interface ValidationRule {
   expectedKeywords?: string[];
   jsonSchema?: object;
   answerPath?: string;
+  mode?: ValidationMode;
+  flakySemantic?: boolean;
+  expectedMinimumBehavior?: string;
 }
 
 export interface ValidationOutcome {
@@ -43,8 +56,24 @@ export interface ValidationOutcome {
   schemaDrift: boolean;
   keywordMiss: boolean;
   genericFailureDetected: boolean;
+  suspiciousSignals: string[];
   answerText?: string;
   suspiciousReason?: string;
+  score: ScoreLabel;
+  knownFlakySemantic: boolean;
+}
+
+export interface ScenarioFixtureEntry {
+  id: string;
+  category: string;
+  prompt: string;
+  conversationHistory?: Array<{ role: string; content: string }>;
+  expectedMinimumBehavior: string;
+  validationMode: ValidationMode;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  tags: string[];
+  expectedKeywords?: string[];
+  knownFlakySemantic?: boolean;
 }
 
 export interface ScenarioDefinition {
@@ -71,4 +100,5 @@ export interface ScenarioMetrics {
   duplicateResponseRatio: number;
   answerLengthAvg: number;
   failures: number;
+  warns: number;
 }

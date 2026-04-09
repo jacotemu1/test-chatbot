@@ -32,6 +32,7 @@ function aggregateSummary(metrics: ScenarioMetrics[]) {
     (acc, item) => {
       acc.total += item.total;
       acc.failures += item.failures;
+      acc.warns += item.warns;
       acc.timeouts += item.timeoutCount;
       acc.non200 += item.non200Count;
       acc.parseFailures += item.parseFailureCount;
@@ -39,7 +40,7 @@ function aggregateSummary(metrics: ScenarioMetrics[]) {
       acc.schemaDrift += item.schemaDriftCount;
       return acc;
     },
-    { total: 0, failures: 0, timeouts: 0, non200: 0, parseFailures: 0, empty: 0, schemaDrift: 0 },
+    { total: 0, failures: 0, warns: 0, timeouts: 0, non200: 0, parseFailures: 0, empty: 0, schemaDrift: 0 },
   );
 
   return {
@@ -47,12 +48,13 @@ function aggregateSummary(metrics: ScenarioMetrics[]) {
     totals,
     successRate: totals.total ? (totals.total - totals.failures) / totals.total : 0,
     scenarios: metrics.length,
+    scenarioFailureSummary: metrics.map((m) => ({ scenario: m.name, failures: m.failures, warns: m.warns })),
   };
 }
 
 function writeHumanHtml(outputDir: string, summary: ReturnType<typeof aggregateSummary>, metrics: ScenarioMetrics[]): void {
   const rows = metrics
-    .map((m) => `<tr><td>${m.name}</td><td>${m.total}</td><td>${(m.successRate * 100).toFixed(1)}%</td><td>${m.p95}</td><td>${m.timeoutCount}</td><td>${m.non200Count}</td><td>${m.schemaDriftCount}</td></tr>`)
+    .map((m) => `<tr><td>${m.name}</td><td>${m.total}</td><td>${(m.successRate * 100).toFixed(1)}%</td><td>${m.p95}</td><td>${m.timeoutCount}</td><td>${m.non200Count}</td><td>${m.warns}</td><td>${m.failures}</td></tr>`)
     .join('\n');
 
   const html = `<!doctype html>
@@ -62,7 +64,7 @@ function writeHumanHtml(outputDir: string, summary: ReturnType<typeof aggregateS
 <h1>Chatbot Stress Summary</h1>
 <p>Generated at: ${summary.generatedAt}</p>
 <p>Success rate: ${(summary.successRate * 100).toFixed(2)}%</p>
-<table><thead><tr><th>Scenario</th><th>Total</th><th>Success</th><th>p95 (ms)</th><th>Timeouts</th><th>Non-200</th><th>Schema Drift</th></tr></thead>
+<table><thead><tr><th>Scenario</th><th>Total</th><th>Success</th><th>p95 (ms)</th><th>Timeouts</th><th>Non-200</th><th>Warn</th><th>Fail</th></tr></thead>
 <tbody>${rows}</tbody></table>
 </body></html>`;
 
@@ -70,7 +72,7 @@ function writeHumanHtml(outputDir: string, summary: ReturnType<typeof aggregateS
 }
 
 function writeCsv(outputDir: string, metrics: ScenarioMetrics[]): void {
-  const header = 'scenario,total,success_rate,p50,p95,p99,timeouts,non200,parse_failures,empty,schema_drift,dup_ratio,answer_len_avg,failures';
+  const header = 'scenario,total,success_rate,p50,p95,p99,timeouts,non200,parse_failures,empty,schema_drift,dup_ratio,answer_len_avg,warns,failures';
   const rows = metrics.map((m) =>
     [
       m.name,
@@ -86,6 +88,7 @@ function writeCsv(outputDir: string, metrics: ScenarioMetrics[]): void {
       m.schemaDriftCount,
       m.duplicateResponseRatio,
       m.answerLengthAvg,
+      m.warns,
       m.failures,
     ].join(','),
   );
@@ -125,18 +128,18 @@ export async function runHarness(): Promise<void> {
   for (const scenario of scenarios) {
     const rows = await runScenario(client, scenario);
     for (const row of rows) {
-      if (
-        row.result.error ||
-        row.result.timedOut ||
-        (row.result.status ?? 0) !== 200 ||
-        row.validation.suspiciousReason
-      ) {
+      const hardFail = row.validation.score === 'fail' || row.result.error || row.result.timedOut || (row.result.status ?? 0) !== 200;
+      const shouldStore = hardFail || row.validation.score === 'warn';
+
+      if (shouldStore) {
         appendJsonl(path.join(config.outputDir, 'failures.jsonl'), {
           requestId: row.result.requestId,
           scenario: row.result.scenario,
           status: row.result.status,
           latencyMs: row.result.latencyMs,
           error: row.result.error,
+          score: row.validation.score,
+          knownFlakySemantic: row.validation.knownFlakySemantic,
           validation: row.validation,
           rawBody: row.result.rawBody,
         });
@@ -158,6 +161,8 @@ export async function runHarness(): Promise<void> {
   console.log(`Profile: ${config.profile}`);
   console.log(`Total requests: ${summary.totals.total}`);
   console.log(`Success rate: ${(summary.successRate * 100).toFixed(2)}%`);
+  console.log(`Warn count: ${summary.totals.warns}`);
+  console.log(`Hard failures: ${summary.totals.failures}`);
   console.log(`Timeouts: ${summary.totals.timeouts}`);
   console.log(`Non-200: ${summary.totals.non200}`);
 }

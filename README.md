@@ -29,6 +29,8 @@ src/
   config.ts
   metrics.ts
   runner.ts
+  scoring.ts
+  suspiciousDetector.ts
   types.ts
   validator.ts
   utils/fs.ts
@@ -36,6 +38,7 @@ scenarios/
   index.ts
 fixtures/
   prompts.it.json
+  scenario-dataset.it.json
 tests/
   chatbot.spec.ts
 reports/                 # generated artifacts
@@ -55,24 +58,63 @@ reports/                 # generated artifacts
 
 Copy `.env.example` to `.env` and customize.
 
+## Dataset design (Italian, breaking-point focused)
+`fixtures/scenario-dataset.it.json` includes 62 categorized prompts and each entry has:
+- `id`
+- `category`
+- `prompt`
+- optional `conversationHistory`
+- `expectedMinimumBehavior`
+- `validationMode`
+- `severity`
+- `tags`
+- optional `expectedKeywords`
+- optional `knownFlakySemantic`
+
+### Covered categories
+- simple factual requests
+- ambiguous prompts
+- long and verbose prompts
+- repeated prompts
+- contradictory instructions
+- prompt injection attempts
+- jailbreak-style prompts
+- malformed input
+- emotionally charged prompts
+- domain-specific requests
+- memory/context consistency checks
+- multi-turn follow-ups
+- nonsense/gibberish inputs
+- adversarial edge cases
+
+### Validation modes
+- `non_empty`
+- `keyword_match`
+- `schema_only`
+- `latency_only`
+- `safety_check`
+- `consistency_check`
+
+## Scoring and suspicious-output logic
+Every evaluated response is labeled with:
+- `pass`
+- `warn`
+- `fail`
+
+Hard failures (`fail`) are never suppressed. `knownFlakySemantic: true` can downgrade semantic-only uncertainty into `warn`, but parse/schema/empty/non-200/timeout failures still remain hard failures.
+
+A rule-based suspicious detector flags outputs containing signs of:
+- possible secret leakage
+- prompt/system-instruction disclosure
+- unsafe instruction acceptance
+- nonsense/fallback patterns
+
 ## Quick start
 
 ```bash
 npm ci
 npm test
 ```
-
-## Available scenario coverage
-- smoke
-- baseline functional prompts
-- concurrency ramp test
-- sustained load test
-- spike test
-- long-input / token-heavy test
-- multi-turn conversation test
-- repeated prompt stability test
-- adversarial jailbreak/prompt-injection test
-- invalid payload / edge-case payload test
 
 ## Stress profiles
 - `light` – quick signal
@@ -94,22 +136,13 @@ Breakpoint search increases concurrency stepwise and records where success rate 
 ## Output artifacts
 Generated in `CHATBOT_OUTPUT_DIR` (default `reports/`):
 - `summary.json`
-- `failures.jsonl`
+- `failures.jsonl` (includes `score`, suspicious signals, flaky markers)
 - `scenario-metrics.json`
 - `scenario-metrics.csv`
 - `junit.xml`
 - `playwright-report.json`
 - `playwright-html/`
 - `report.html` (human-readable scenario table)
-
-## Validation and suspicious-output detection
-For each response, the harness captures:
-- HTTP status, headers, raw body, parsed body, latency, timeout/errors
-- parse failures and empty answer detection
-- configurable schema validation (AJV)
-- optional keyword expectations
-- generic refusal/failure phrase detection
-- failed and suspicious request/response artifacts in `failures.jsonl`
 
 ## CI notes (internal endpoint)
 This endpoint is internal and usually unreachable from GitHub-hosted runners. Use:
@@ -121,5 +154,5 @@ The included GitHub Action is `workflow_dispatch`-only and uploads artifacts eve
 ## Design choices (brief)
 - Playwright provides mature assertions + JUnit/HTML/JSON reporters out-of-the-box.
 - Custom runner provides fine-grained concurrency control and scenario extensibility.
-- Scenario definitions and fixtures are separated for easy dataset growth (including Italian starter prompts).
+- Scenario dataset is externalized to JSON so adding new prompts does not require code edits.
 - Failure artifacts are append-only JSONL for postmortem-friendly debugging.
