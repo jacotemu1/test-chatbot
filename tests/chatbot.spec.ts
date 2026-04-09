@@ -40,11 +40,15 @@ test.describe('Chatbot robustness harness', () => {
     const failuresPath = path.join(config.outputDir, 'failures.jsonl');
     const conversationMetricsPath = path.join(config.outputDir, 'conversation-metrics.json');
     const dashboardPath = path.join(config.outputDir, 'dashboard.html');
+    const salesMetricsPath = path.join(config.outputDir, 'sales-metrics.json');
+    const executiveSummaryPath = path.join(config.outputDir, 'executive-summary.md');
 
     expect(fs.existsSync(summaryPath)).toBeTruthy();
     expect(fs.existsSync(scenarioPath)).toBeTruthy();
     expect(fs.existsSync(conversationMetricsPath)).toBeTruthy();
     expect(fs.existsSync(dashboardPath)).toBeTruthy();
+    expect(fs.existsSync(salesMetricsPath)).toBeTruthy();
+    expect(fs.existsSync(executiveSummaryPath)).toBeTruthy();
 
     const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8')) as {
       successRate: number;

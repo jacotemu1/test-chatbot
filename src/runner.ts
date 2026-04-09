@@ -3,18 +3,14 @@ import path from 'node:path';
 import { ChatbotClient } from './client/chatbotClient';
 import { loadConfig } from './config';
 import { computeScenarioMetrics, EvaluatedResult } from './metrics';
+import { evaluateSalesSignals } from './salesEvaluator';
 import { validateResult } from './validator';
 import { appendJsonl, ensureDir, writeJson } from './utils/fs';
-import {
-  BreakpointStepMetrics,
-  ConversationRunMetrics,
-  ConversationScenario,
-  HarnessConfig,
-  ScenarioDefinition,
-  ScenarioMetrics,
-} from './types';
+import { BreakpointStepMetrics, ConversationRunMetrics, ConversationScenario, HarnessConfig, ScenarioDefinition, ScenarioMetrics } from './types';
 import { buildScenarios, profileOverrides } from '../scenarios';
 import { buildConversationScenarios } from '../scenarios/conversations';
+
+type ScenarioRow = EvaluatedResult & { prompt: string; salesSignals: ReturnType<typeof evaluateSalesSignals> };
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -22,15 +18,18 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return chunks;
 }
 
-async function runScenario(client: ChatbotClient, scenario: ScenarioDefinition): Promise<EvaluatedResult[]> {
+async function runScenario(client: ChatbotClient, scenario: ScenarioDefinition): Promise<ScenarioRow[]> {
   const batches = chunkArray(scenario.requests, Math.max(1, scenario.concurrency));
-  const results: EvaluatedResult[] = [];
+  const results: ScenarioRow[] = [];
 
   for (const batch of batches) {
     const settled = await Promise.all(batch.map((payload) => client.send(payload, scenario.name, scenario.timeoutMs)));
-    for (const result of settled) {
-      results.push({ result, validation: validateResult(result, scenario.validation) });
-    }
+    settled.forEach((result, idx) => {
+      const prompt = String(batch[idx].input ?? '');
+      const validation = validateResult(result, scenario.validation);
+      const answerText = validation.answerText ?? result.rawBody ?? '';
+      results.push({ result, validation, prompt, salesSignals: evaluateSalesSignals(prompt, answerText) });
+    });
   }
 
   return results;
@@ -57,50 +56,12 @@ function aggregateSummary(metrics: ScenarioMetrics[]) {
     totals,
     successRate: totals.total ? (totals.total - totals.failures) / totals.total : 0,
     scenarios: metrics.length,
-    scenarioFailureSummary: metrics.map((m) => ({ scenario: m.name, failures: m.failures, warns: m.warns })),
   };
-}
-
-function writeHumanHtml(outputDir: string, summary: ReturnType<typeof aggregateSummary>, metrics: ScenarioMetrics[]): void {
-  const rows = metrics
-    .map((m) => `<tr><td>${m.name}</td><td>${m.total}</td><td>${(m.successRate * 100).toFixed(1)}%</td><td>${m.p95}</td><td>${m.timeoutCount}</td><td>${m.non200Count}</td><td>${m.warns}</td><td>${m.failures}</td></tr>`)
-    .join('\n');
-
-  const html = `<!doctype html>
-<html><head><meta charset="utf-8"/><title>Chatbot Stress Report</title>
-<style>body{font-family:Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;} td,th{border:1px solid #ddd;padding:8px;} th{background:#f4f4f4;}</style>
-</head><body>
-<h1>Chatbot Stress Summary</h1>
-<p>Generated at: ${summary.generatedAt}</p>
-<p>Success rate: ${(summary.successRate * 100).toFixed(2)}%</p>
-<table><thead><tr><th>Scenario</th><th>Total</th><th>Success</th><th>p95 (ms)</th><th>Timeouts</th><th>Non-200</th><th>Warn</th><th>Fail</th></tr></thead>
-<tbody>${rows}</tbody></table>
-</body></html>`;
-
-  fs.writeFileSync(path.join(outputDir, 'report.html'), html, 'utf8');
 }
 
 function writeCsv(outputDir: string, metrics: ScenarioMetrics[]): void {
   const header = 'scenario,total,success_rate,p50,p95,p99,timeouts,non200,parse_failures,empty,schema_drift,dup_ratio,answer_len_avg,warns,failures';
-  const rows = metrics.map((m) =>
-    [
-      m.name,
-      m.total,
-      m.successRate,
-      m.p50,
-      m.p95,
-      m.p99,
-      m.timeoutCount,
-      m.non200Count,
-      m.parseFailureCount,
-      m.emptyResponseCount,
-      m.schemaDriftCount,
-      m.duplicateResponseRatio,
-      m.answerLengthAvg,
-      m.warns,
-      m.failures,
-    ].join(','),
-  );
+  const rows = metrics.map((m) => [m.name,m.total,m.successRate,m.p50,m.p95,m.p99,m.timeoutCount,m.non200Count,m.parseFailureCount,m.emptyResponseCount,m.schemaDriftCount,m.duplicateResponseRatio,m.answerLengthAvg,m.warns,m.failures].join(','));
   fs.writeFileSync(path.join(outputDir, 'scenario-metrics.csv'), [header, ...rows].join('\n'), 'utf8');
 }
 
@@ -124,24 +85,13 @@ function runConversationMetrics(scenario: ConversationScenario, turns: Array<{ t
     const observed = byTurn.get(scriptedTurn.id);
     if (!observed) continue;
 
-    if (scriptedTurn.expectKeywords && scriptedTurn.expectKeywords.length > 0) {
-      if (!hasKeyword(observed.answer, scriptedTurn.expectKeywords)) {
-        memoryFailures += 1;
-      }
-    }
-
-    if (scriptedTurn.memoryCheckForTurnId) {
-      const referenced = byTurn.get(scriptedTurn.memoryCheckForTurnId);
-      if (referenced && scriptedTurn.expectKeywords && !hasKeyword(observed.answer, scriptedTurn.expectKeywords)) {
-        memoryFailures += 1;
-      }
+    if (scriptedTurn.expectKeywords && scriptedTurn.expectKeywords.length > 0 && !hasKeyword(observed.answer, scriptedTurn.expectKeywords)) {
+      memoryFailures += 1;
     }
 
     if (scriptedTurn.contradictionWithTurnId) {
       const prior = byTurn.get(scriptedTurn.contradictionWithTurnId);
-      if (prior && normalize(prior.answer) === normalize(observed.answer)) {
-        consistencyViolations += 1;
-      }
+      if (prior && normalize(prior.answer) === normalize(observed.answer)) consistencyViolations += 1;
     }
 
     if (scriptedTurn.rephraseGroup) {
@@ -152,25 +102,16 @@ function runConversationMetrics(scenario: ConversationScenario, turns: Array<{ t
   }
 
   for (const answers of rephraseBuckets.values()) {
-    if (answers.length >= 2) {
-      const unique = new Set(answers);
-      if (unique.size === answers.length) unstableRephraseCount += 1;
-    }
+    if (answers.length >= 2 && new Set(answers).size === answers.length) unstableRephraseCount += 1;
   }
 
   const turnLatenciesMs = turns.map((t) => t.latencyMs);
   const completedTurns = turns.filter((t) => t.ok).length;
   const completionRate = scenario.turns.length ? completedTurns / scenario.turns.length : 0;
-  const avgTurnLatencyMs = turnLatenciesMs.length
-    ? turnLatenciesMs.reduce((a, b) => a + b, 0) / turnLatenciesMs.length
-    : 0;
-
+  const avgTurnLatencyMs = turnLatenciesMs.length ? turnLatenciesMs.reduce((a, b) => a + b, 0) / turnLatenciesMs.length : 0;
   const split = Math.max(1, Math.floor(turnLatenciesMs.length * 0.3));
-  const early = turnLatenciesMs.slice(0, split);
-  const late = turnLatenciesMs.slice(-split);
-  const earlyAvg = early.length ? early.reduce((a, b) => a + b, 0) / early.length : 1;
-  const lateAvg = late.length ? late.reduce((a, b) => a + b, 0) / late.length : earlyAvg;
-  const lateTurnLatencyGrowthRatio = earlyAvg > 0 ? lateAvg / earlyAvg : 1;
+  const earlyAvg = turnLatenciesMs.slice(0, split).reduce((a, b) => a + b, 0) / split;
+  const lateAvg = turnLatenciesMs.slice(-split).reduce((a, b) => a + b, 0) / split;
 
   return {
     scenario: scenario.name,
@@ -179,7 +120,7 @@ function runConversationMetrics(scenario: ConversationScenario, turns: Array<{ t
     completionRate,
     turnLatenciesMs,
     avgTurnLatencyMs,
-    lateTurnLatencyGrowthRatio,
+    lateTurnLatencyGrowthRatio: earlyAvg > 0 ? lateAvg / earlyAvg : 1,
     consistencyViolations,
     memoryFailures,
     unstableRephraseCount,
@@ -194,228 +135,12 @@ async function runConversationScenario(client: ChatbotClient, scenario: Conversa
     const result = await client.send({ input: turn.userPrompt, context: history }, `conversation-${scenario.name}`);
     const validation = validateResult(result, { mode: 'consistency_check', expectedKeywords: turn.expectKeywords });
     const answer = validation.answerText ?? result.rawBody ?? '';
-
-    turns.push({
-      turnId: turn.id,
-      answer,
-      latencyMs: result.latencyMs,
-      ok: !result.error && !result.timedOut && (result.status ?? 0) === 200 && validation.score !== 'fail',
-    });
-
+    turns.push({ turnId: turn.id, answer, latencyMs: result.latencyMs, ok: !result.error && !result.timedOut && (result.status ?? 0) === 200 && validation.score !== 'fail' });
     history.push({ role: 'user', content: turn.userPrompt });
     history.push({ role: 'assistant', content: answer || '[empty]' });
   }
 
   return runConversationMetrics(scenario, turns);
-}
-
-function writeConversationMarkdown(outputDir: string, items: ConversationRunMetrics[]): void {
-  const rows = items
-    .map((m) => `| ${m.scenario} | ${(m.completionRate * 100).toFixed(1)}% | ${m.avgTurnLatencyMs.toFixed(0)} | ${m.lateTurnLatencyGrowthRatio.toFixed(2)}x | ${m.consistencyViolations} | ${m.memoryFailures} | ${m.unstableRephraseCount} |`)
-    .join('\n');
-
-  const healthy = items.filter((m) => m.completionRate >= 0.95 && m.consistencyViolations === 0 && m.memoryFailures === 0);
-  const degrading = items.filter((m) => m.lateTurnLatencyGrowthRatio > 1.2 || m.unstableRephraseCount > 0);
-  const unreliable = items.filter((m) => m.completionRate < 0.9 || m.consistencyViolations > 0 || m.memoryFailures > 0);
-
-  const md = [
-    '# Conversation Session Summary',
-    '',
-    '## Interpretazione',
-    `- **Healthy**: ${healthy.map((x) => x.scenario).join(', ') || 'nessuno scenario chiaramente sano'}.`,
-    `- **Starts degrading**: ${degrading.map((x) => x.scenario).join(', ') || 'non rilevato'}.`,
-    `- **Unreliable**: ${unreliable.map((x) => x.scenario).join(', ') || 'non rilevato'}.`,
-    '',
-    '## Tabella metriche conversazionali',
-    '| Scenario | Completion rate | Avg turn latency (ms) | Late-turn growth | Consistency violations | Memory failures | Rephrase instability |',
-    '|---|---:|---:|---:|---:|---:|---:|',
-    rows,
-    '',
-  ].join('\n');
-
-  fs.writeFileSync(path.join(outputDir, 'conversation-summary.md'), md, 'utf8');
-}
-
-function buildDashboardHtml(data: unknown): string {
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Chatbot Stress Dashboard</title>
-  <style>
-    body{font-family:Arial,sans-serif;margin:20px;background:#fafafa;color:#111}
-    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
-    .card{background:#fff;padding:12px;border:1px solid #ddd;border-radius:8px}
-    table{width:100%;border-collapse:collapse;background:#fff;margin:10px 0}
-    th,td{border:1px solid #ddd;padding:8px;text-align:left;font-size:13px}
-    th{background:#f1f1f1}
-    h2{margin-top:24px}
-    .muted{color:#666;font-size:12px}
-    .bar{height:8px;background:#e6e6e6;border-radius:4px;overflow:hidden}
-    .fill{height:100%;background:#db3b3b}
-    details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:8px;margin:8px 0}
-    code{white-space:pre-wrap;display:block}
-  </style>
-</head>
-<body>
-  <h1>Chatbot Stress Dashboard</h1>
-  <div id="app"></div>
-  <script>
-    const data = ${JSON.stringify(data)};
-
-    function pct(v){ return (v*100).toFixed(2)+'%'; }
-    function esc(s){ return String(s ?? ''); }
-
-    const app = document.getElementById('app');
-    const cards = [
-      ['Total requests', data.summary?.totals?.total ?? 0],
-      ['Success rate', pct(data.summary?.successRate ?? 0)],
-      ['Hard failures', data.summary?.totals?.failures ?? 0],
-      ['Timeouts', data.summary?.totals?.timeouts ?? 0],
-      ['Warns', data.summary?.totals?.warns ?? 0],
-      ['Scenarios', data.summary?.scenarios ?? 0],
-    ];
-
-    let trendHtml = '<p class="muted">No previous run baseline found.</p>';
-    if (data.previousSummary) {
-      const srDelta = (data.summary.successRate - data.previousSummary.successRate) * 100;
-      trendHtml = `<p><b>Trend vs previous:</b> Success rate delta: ${srDelta.toFixed(2)} pp</p>`;
-    }
-
-    const latency = data.latency;
-
-    const errorRows = (data.scenarioMetrics || []).map(m => {
-      const total = Math.max(1, m.total);
-      const failRate = m.failures / total;
-      return `<tr>
-        <td>${esc(m.name)}</td>
-        <td>${m.total}</td>
-        <td>${m.failures}</td>
-        <td>${m.timeoutCount}</td>
-        <td>${m.non200Count}</td>
-        <td>${m.schemaDriftCount}</td>
-        <td>${pct(failRate)}</td>
-      </tr>`;
-    }).join('');
-
-    const worstRows = (data.worstScenarios || []).map(w => {
-      const total = Math.max(1, w.total);
-      const failRate = w.failures / total;
-      return `<tr>
-        <td>${esc(w.name)}</td>
-        <td>${w.failures}/${w.total}</td>
-        <td><div class="bar"><div class="fill" style="width:${Math.min(100, failRate*100)}%"></div></div> ${pct(failRate)}</td>
-      </tr>`;
-    }).join('');
-
-    const suspiciousRows = (data.suspicious || []).map(x => `<tr><td>${esc(x.scenario)}</td><td>${esc(x.score)}</td><td>${esc(x.reason)}</td><td>${esc(x.excerpt)}</td></tr>`).join('');
-
-    const concurrencyRows = (data.concurrencyVsFailure || []).map(x => `<tr><td>${x.concurrency}</td><td>${pct(x.failureRate)}</td><td>${esc(x.status)}</td></tr>`).join('');
-
-    const artifactLinks = (data.artifactLinks || []).map(x => `<li><a href="${x.href}">${x.name}</a></li>`).join('');
-
-    app.innerHTML = `
-      <div class="cards">${cards.map(c=>`<div class="card"><div class="muted">${c[0]}</div><div><b>${c[1]}</b></div></div>`).join('')}</div>
-      ${trendHtml}
-
-      <h2>Latency percentiles</h2>
-      <table><tr><th>p50</th><th>p95</th><th>p99</th></tr><tr><td>${latency.p50}</td><td>${latency.p95}</td><td>${latency.p99}</td></tr></table>
-
-      <h2>Error breakdown by scenario</h2>
-      <table><tr><th>Scenario</th><th>Total</th><th>Failures</th><th>Timeouts</th><th>Non-200</th><th>Schema drift</th><th>Failure rate</th></tr>${errorRows}</table>
-
-      <h2>Concurrency vs failure rate</h2>
-      <table><tr><th>Concurrency</th><th>Failure rate</th><th>Status</th></tr>${concurrencyRows || '<tr><td colspan="3">Available after breakpoint profile run.</td></tr>'}</table>
-
-      <h2>Worst scenarios</h2>
-      <table><tr><th>Scenario</th><th>Failures</th><th>Rate</th></tr>${worstRows}</table>
-
-      <h2>Suspicious outputs</h2>
-      <table><tr><th>Scenario</th><th>Score</th><th>Reason</th><th>Excerpt</th></tr>${suspiciousRows || '<tr><td colspan="4">No suspicious outputs captured.</td></tr>'}</table>
-
-      <h2>Artifacts</h2>
-      <ul>${artifactLinks}</ul>
-
-      <h2>Embedded excerpts</h2>
-      <details><summary>summary.json</summary><code>${esc(JSON.stringify(data.summary, null, 2))}</code></details>
-      <details><summary>first suspicious record</summary><code>${esc(JSON.stringify((data.suspiciousRaw||[])[0] || {}, null, 2))}</code></details>
-    `;
-  </script>
-</body>
-</html>`;
-}
-
-function writeDashboard(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], breakpointSteps: BreakpointStepMetrics[]): void {
-  const previousSummaryPath = path.join(outputDir, 'previous-summary.json');
-  const previousSummary = fs.existsSync(previousSummaryPath)
-    ? JSON.parse(fs.readFileSync(previousSummaryPath, 'utf8'))
-    : null;
-
-  const failuresPath = path.join(outputDir, 'failures.jsonl');
-  const failureRows = fs.existsSync(failuresPath)
-    ? fs.readFileSync(failuresPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
-    : [];
-
-  const suspicious = failureRows
-    .filter((x) => x.validation?.suspiciousReason || (x.validation?.suspiciousSignals || []).length > 0)
-    .slice(0, 15)
-    .map((x) => ({
-      scenario: x.scenario,
-      score: x.score,
-      reason: x.validation?.suspiciousReason || (x.validation?.suspiciousSignals || []).join('; '),
-      excerpt: String(x.rawBody || '').slice(0, 200),
-    }));
-
-  const weighted = scenarioMetrics.reduce((acc, m) => {
-    acc.total += m.total;
-    acc.p50 += m.p50 * m.total;
-    acc.p95 += m.p95 * m.total;
-    acc.p99 += m.p99 * m.total;
-    return acc;
-  }, { total: 0, p50: 0, p95: 0, p99: 0 });
-
-  const latency = weighted.total
-    ? {
-        p50: Math.round(weighted.p50 / weighted.total),
-        p95: Math.round(weighted.p95 / weighted.total),
-        p99: Math.round(weighted.p99 / weighted.total),
-      }
-    : { p50: 0, p95: 0, p99: 0 };
-
-  const worstScenarios = [...scenarioMetrics]
-    .sort((a, b) => (b.failures / Math.max(1, b.total)) - (a.failures / Math.max(1, a.total)))
-    .slice(0, 5);
-
-  const concurrencyVsFailure = breakpointSteps.map((s) => ({
-    concurrency: s.concurrency,
-    failureRate: s.timeoutRate + s.errorRate + s.emptyResponseRate + s.schemaDriftRate,
-    status: s.healthy ? 'Healthy' : 'Unstable',
-  }));
-
-  const artifactLinks = [
-    'summary.json',
-    'scenario-metrics.json',
-    'conversation-metrics.json',
-    'failures.jsonl',
-    'report.html',
-    'conversation-summary.md',
-    'breakpoint-summary.json',
-    'breakpoint-summary.md',
-  ].map((name) => ({ name, href: name }));
-
-  const dashboardData = {
-    summary,
-    previousSummary,
-    latency,
-    scenarioMetrics,
-    worstScenarios,
-    suspicious,
-    suspiciousRaw: failureRows,
-    concurrencyVsFailure,
-    artifactLinks,
-  };
-
-  fs.writeFileSync(path.join(outputDir, 'dashboard.html'), buildDashboardHtml(dashboardData), 'utf8');
 }
 
 function evaluateBreakpointStep(metrics: ScenarioMetrics, concurrency: number, config: HarnessConfig): BreakpointStepMetrics {
@@ -426,73 +151,13 @@ function evaluateBreakpointStep(metrics: ScenarioMetrics, concurrency: number, c
   const schemaDriftRate = metrics.schemaDriftCount / total;
 
   const violations: string[] = [];
-  if (metrics.p95 > config.breakpointThresholds.maxP95LatencyMs) {
-    violations.push(`p95 latency ${metrics.p95}ms > ${config.breakpointThresholds.maxP95LatencyMs}ms`);
-  }
-  if (timeoutRate > config.breakpointThresholds.maxTimeoutRate) {
-    violations.push(`timeout rate ${(timeoutRate * 100).toFixed(2)}% > ${(config.breakpointThresholds.maxTimeoutRate * 100).toFixed(2)}%`);
-  }
-  if (errorRate > config.breakpointThresholds.maxErrorRate) {
-    violations.push(`error rate ${(errorRate * 100).toFixed(2)}% > ${(config.breakpointThresholds.maxErrorRate * 100).toFixed(2)}%`);
-  }
-  if (emptyResponseRate > config.breakpointThresholds.maxEmptyResponseRate) {
-    violations.push(`empty response rate ${(emptyResponseRate * 100).toFixed(2)}% > ${(config.breakpointThresholds.maxEmptyResponseRate * 100).toFixed(2)}%`);
-  }
-  if (schemaDriftRate > config.breakpointThresholds.maxSchemaDriftRate) {
-    violations.push(`schema drift rate ${(schemaDriftRate * 100).toFixed(2)}% > ${(config.breakpointThresholds.maxSchemaDriftRate * 100).toFixed(2)}%`);
-  }
+  if (metrics.p95 > config.breakpointThresholds.maxP95LatencyMs) violations.push('p95 latency');
+  if (timeoutRate > config.breakpointThresholds.maxTimeoutRate) violations.push('timeout rate');
+  if (errorRate > config.breakpointThresholds.maxErrorRate) violations.push('error rate');
+  if (emptyResponseRate > config.breakpointThresholds.maxEmptyResponseRate) violations.push('empty response rate');
+  if (schemaDriftRate > config.breakpointThresholds.maxSchemaDriftRate) violations.push('schema drift rate');
 
-  return {
-    concurrency,
-    total,
-    p95LatencyMs: metrics.p95,
-    timeoutRate,
-    errorRate,
-    emptyResponseRate,
-    schemaDriftRate,
-    healthy: violations.length === 0,
-    violations,
-  };
-}
-
-function buildBreakpointMarkdown(steps: BreakpointStepMetrics[], bestStableConcurrency: number, firstUnstableConcurrency: number | null): string {
-  const healthy = steps.filter((s) => s.healthy);
-  const degrading = steps.filter((s) => !s.healthy && s.violations.length <= 2);
-
-  const rows = steps
-    .map((s) => `| ${s.concurrency} | ${s.total} | ${s.p95LatencyMs} | ${(s.timeoutRate * 100).toFixed(2)}% | ${(s.errorRate * 100).toFixed(2)}% | ${(s.emptyResponseRate * 100).toFixed(2)}% | ${(s.schemaDriftRate * 100).toFixed(2)}% | ${s.healthy ? 'Healthy' : `Unstable: ${s.violations.join('; ')}`} |`)
-    .join('\n');
-
-  const healthyText = healthy.length
-    ? `Il sistema appare **sano** fino a concorrenza ${bestStableConcurrency}, con metriche sotto soglia.`
-    : 'Il sistema non mostra una fascia chiaramente sana nelle misurazioni eseguite.';
-
-  const degradingText = degrading.length
-    ? `La degradazione inizia a emergere a partire da concorrenza ${degrading[0].concurrency}, con violazioni moderate.`
-    : 'Non sono state osservate fasi di degradazione graduale prima dell\'instabilità forte.';
-
-  const unreliableText = firstUnstableConcurrency !== null
-    ? `Il sistema diventa **inaffidabile** da concorrenza ${firstUnstableConcurrency} in poi (prima soglia SLA violata).`
-    : 'Non è stato rilevato un punto di instabilità nelle soglie configurate.';
-
-  return [
-    '# Breakpoint Discovery Summary',
-    '',
-    '## Interpretazione',
-    `- ${healthyText}`,
-    `- ${degradingText}`,
-    `- ${unreliableText}`,
-    '',
-    '## Stima operativa',
-    `- **Best stable concurrency:** ${bestStableConcurrency}`,
-    `- **First unstable concurrency:** ${firstUnstableConcurrency ?? 'non rilevata'}`,
-    '',
-    '## Tabella per step',
-    '| Concurrency | Requests | p95 (ms) | Timeout rate | Error rate | Empty rate | Schema drift rate | Stato |',
-    '|---:|---:|---:|---:|---:|---:|---:|---|',
-    rows,
-    '',
-  ].join('\n');
+  return { concurrency, total, p95LatencyMs: metrics.p95, timeoutRate, errorRate, emptyResponseRate, schemaDriftRate, healthy: violations.length === 0, violations };
 }
 
 async function runBreakpointSearch(baseConfig: HarnessConfig): Promise<{ steps: BreakpointStepMetrics[]; bestStableConcurrency: number; firstUnstableConcurrency: number | null; }> {
@@ -502,34 +167,59 @@ async function runBreakpointSearch(baseConfig: HarnessConfig): Promise<{ steps: 
   let firstUnstableConcurrency: number | null = null;
 
   for (let concurrency = 1; concurrency <= baseConfig.maxConcurrency; concurrency += stepSize) {
-    const iterationConfig = { ...baseConfig, maxConcurrency: concurrency };
-    const client = new ChatbotClient(iterationConfig);
-    const requests = Array.from({ length: Math.max(50, Math.floor(baseConfig.totalRequests / 2)) }, (_, i) => ({
-      input: `Breakpoint probe #${i}: descrivi sicurezza pneumatici in 2 frasi.`,
-    }));
-
-    const scenario: ScenarioDefinition = {
-      name: `breakpoint-${concurrency}`,
-      requests,
-      concurrency,
-      validation: { mode: 'non_empty' },
-    };
-
-    const evaluated = await runScenario(client, scenario);
-    const metrics = computeScenarioMetrics(scenario.name, evaluated);
-    const stepMetrics = evaluateBreakpointStep(metrics, concurrency, baseConfig);
-    steps.push(stepMetrics);
-
-    if (stepMetrics.healthy) {
-      bestStableConcurrency = concurrency;
-      continue;
-    }
-
-    firstUnstableConcurrency = concurrency;
-    break;
+    const client = new ChatbotClient({ ...baseConfig, maxConcurrency: concurrency });
+    const requests = Array.from({ length: Math.max(50, Math.floor(baseConfig.totalRequests / 2)) }, (_, i) => ({ input: `Breakpoint probe #${i}: consiglio gomme con sicurezza.` }));
+    const rows = await runScenario(client, { name: `breakpoint-${concurrency}`, requests, concurrency, validation: { mode: 'non_empty' } });
+    const metrics = computeScenarioMetrics(`breakpoint-${concurrency}`, rows);
+    const step = evaluateBreakpointStep(metrics, concurrency, baseConfig);
+    steps.push(step);
+    if (step.healthy) bestStableConcurrency = concurrency; else { firstUnstableConcurrency = concurrency; break; }
   }
 
   return { steps, bestStableConcurrency, firstUnstableConcurrency };
+}
+
+function renderStaticDashboard(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], sales: Record<string, number>, breakpointSteps: BreakpointStepMetrics[], suspiciousRows: Array<{scenario:string;reason:string;excerpt:string}>): void {
+  const worst = [...scenarioMetrics].sort((a, b) => (b.failures/Math.max(1,b.total))-(a.failures/Math.max(1,a.total))).slice(0,5);
+  const errorRows = scenarioMetrics.map(m => `<tr><td>${m.name}</td><td>${m.failures}</td><td>${m.timeoutCount}</td><td>${m.non200Count}</td><td>${m.schemaDriftCount}</td></tr>`).join('');
+  const worstRows = worst.map(m => `<tr><td>${m.name}</td><td>${m.failures}/${m.total}</td></tr>`).join('');
+  const concRows = breakpointSteps.length ? breakpointSteps.map(s => `<tr><td>${s.concurrency}</td><td>${((s.timeoutRate+s.errorRate+s.emptyResponseRate+s.schemaDriftRate)*100).toFixed(2)}%</td><td>${s.healthy?'Healthy':'Unstable'}</td></tr>`).join('') : '<tr><td colspan="3">Run profile=breakpoint to populate.</td></tr>';
+  const suspRows = suspiciousRows.length ? suspiciousRows.map(s => `<tr><td>${s.scenario}</td><td>${s.reason}</td><td>${s.excerpt}</td></tr>`).join('') : '<tr><td colspan="3">No suspicious outputs captured.</td></tr>';
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Stress Dashboard</title><style>body{font-family:Arial;margin:20px} .cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px} .card{border:1px solid #ddd;padding:10px;border-radius:8px} table{border-collapse:collapse;width:100%;margin-top:10px} th,td{border:1px solid #ddd;padding:6px}</style></head><body>
+<h1>Chatbot Stress Dashboard</h1>
+<div class="cards">
+<div class="card"><b>Total</b><br>${summary.totals.total}</div>
+<div class="card"><b>Success</b><br>${(summary.successRate*100).toFixed(2)}%</div>
+<div class="card"><b>Failures</b><br>${summary.totals.failures}</div>
+<div class="card"><b>Timeouts</b><br>${summary.totals.timeouts}</div>
+</div>
+<h2>Sales guidance metrics</h2>
+<ul>
+<li>Fitment clarification rate: ${(sales.fitmentClarificationRate*100).toFixed(2)}%</li>
+<li>Purchase guidance rate: ${(sales.purchaseGuidanceRate*100).toFixed(2)}%</li>
+<li>CTA presence rate: ${(sales.ctaPresenceRate*100).toFixed(2)}%</li>
+<li>Early recommendation rate: ${(sales.earlyRecommendationRate*100).toFixed(2)}%</li>
+<li>Suspicious response rate: ${(sales.suspiciousResponseRate*100).toFixed(2)}%</li>
+</ul>
+<h2>Error breakdown by scenario</h2><table><tr><th>Scenario</th><th>Failures</th><th>Timeouts</th><th>Non-200</th><th>Schema drift</th></tr>${errorRows}</table>
+<h2>Concurrency vs failure rate</h2><table><tr><th>Concurrency</th><th>Failure rate</th><th>Status</th></tr>${concRows}</table>
+<h2>Worst scenarios</h2><table><tr><th>Scenario</th><th>Failure ratio</th></tr>${worstRows}</table>
+<h2>Suspicious outputs</h2><table><tr><th>Scenario</th><th>Reason</th><th>Excerpt</th></tr>${suspRows}</table>
+<h2>Artifacts</h2><ul><li><a href="summary.json">summary.json</a></li><li><a href="scenario-metrics.json">scenario-metrics.json</a></li><li><a href="failures.jsonl">failures.jsonl</a></li><li><a href="executive-summary.md">executive-summary.md</a></li></ul>
+</body></html>`;
+  fs.writeFileSync(path.join(outputDir, 'dashboard.html'), html, 'utf8');
+}
+
+function writeExecutiveSummary(outputDir: string, summary: ReturnType<typeof aggregateSummary>, sales: Record<string, number>, scenarioMetrics: ScenarioMetrics[], breakpoint: {bestStableConcurrency:number;firstUnstableConcurrency:number|null}): void {
+  const strong = [];
+  if (sales.purchaseGuidanceRate >= 0.6) strong.push('buona capacità di guidare verso il prossimo passo commerciale');
+  if (sales.fitmentClarificationRate >= 0.6) strong.push('buona raccolta delle informazioni di fitment');
+  if (summary.successRate >= 0.9) strong.push('solidità tecnica generale');
+
+  const fitmentFails = scenarioMetrics.filter((s) => s.name.includes('fitment') && s.failures > 0).map((s) => s.name);
+  const commercialFails = sales.ctaPresenceRate < 0.5 || sales.tooGenericRate > 0.3;
+  const md = `# Executive Summary\n\n## Dove il bot è forte\n- ${strong.length ? strong.join('\n- ') : 'Prestazioni forti non ancora evidenti con il profilo corrente.'}\n\n## Dove fallisce nel fitment journey\n- ${fitmentFails.length ? fitmentFails.join(', ') : 'Nessun fallimento fitment critico rilevato.'}\n\n## Dove perde efficacia commerciale\n- CTA presence rate: ${(sales.ctaPresenceRate*100).toFixed(2)}%\n- Purchase guidance rate: ${(sales.purchaseGuidanceRate*100).toFixed(2)}%\n- Segnale perdita efficacia: ${commercialFails ? 'SI' : 'NO'}\n\n## Degrado conversazionale sotto stress tecnico\n- Success rate: ${(summary.successRate*100).toFixed(2)}%\n- Timeout rate: ${(summary.totals.timeouts/Math.max(1,summary.totals.total)*100).toFixed(2)}%\n- Suspicious response rate: ${(sales.suspiciousResponseRate*100).toFixed(2)}%\n\n## Safe operating range stimato\n- Best stable concurrency: ${breakpoint.bestStableConcurrency}\n- First unstable concurrency: ${breakpoint.firstUnstableConcurrency ?? 'non rilevata'}\n`;
+  fs.writeFileSync(path.join(outputDir, 'executive-summary.md'), md, 'utf8');
 }
 
 export async function runHarness(): Promise<void> {
@@ -541,75 +231,72 @@ export async function runHarness(): Promise<void> {
   const scenarios = buildScenarios(config);
   const conversationScenarios = buildConversationScenarios();
 
-  const metrics: ScenarioMetrics[] = [];
+  const scenarioMetrics: ScenarioMetrics[] = [];
+  const allRows: ScenarioRow[] = [];
 
   for (const scenario of scenarios) {
     const rows = await runScenario(client, scenario);
+    allRows.push(...rows);
     for (const row of rows) {
       const hardFail = row.validation.score === 'fail' || row.result.error || row.result.timedOut || (row.result.status ?? 0) !== 200;
-      const shouldStore = hardFail || row.validation.score === 'warn';
-
-      if (shouldStore) {
+      if (hardFail || row.validation.score === 'warn') {
         appendJsonl(path.join(config.outputDir, 'failures.jsonl'), {
           requestId: row.result.requestId,
           scenario: row.result.scenario,
           status: row.result.status,
           latencyMs: row.result.latencyMs,
-          error: row.result.error,
           score: row.validation.score,
-          knownFlakySemantic: row.validation.knownFlakySemantic,
           validation: row.validation,
+          salesSignals: row.salesSignals,
           rawBody: row.result.rawBody,
         });
       }
     }
-    metrics.push(computeScenarioMetrics(scenario.name, rows));
+    scenarioMetrics.push(computeScenarioMetrics(scenario.name, rows));
   }
 
   const conversationMetrics: ConversationRunMetrics[] = [];
-  for (const convScenario of conversationScenarios) {
-    const run = await runConversationScenario(client, convScenario);
-    conversationMetrics.push(run);
-  }
+  for (const conv of conversationScenarios) conversationMetrics.push(await runConversationScenario(client, conv));
 
   const breakpoint = config.profile === 'breakpoint'
     ? await runBreakpointSearch(config)
     : { steps: [], bestStableConcurrency: 0, firstUnstableConcurrency: null };
 
-  const summary = aggregateSummary(metrics);
-  const breakpointMarkdown = breakpoint.steps.length
-    ? buildBreakpointMarkdown(breakpoint.steps, breakpoint.bestStableConcurrency, breakpoint.firstUnstableConcurrency)
-    : '';
+  const summary = aggregateSummary(scenarioMetrics);
 
-  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, conversationScenarios: conversationMetrics.length, breakpoint });
-  writeJson(path.join(config.outputDir, 'scenario-metrics.json'), metrics);
+  const total = Math.max(1, allRows.length);
+  const purchaseRows = allRows.filter((r) => r.result.scenario.includes('purchase') || r.prompt.toLowerCase().includes('compra'));
+  const fitmentRows = allRows.filter((r) => r.result.scenario.includes('fitment'));
+  const suspiciousRows = allRows.filter((r) => !!r.validation.suspiciousReason).map((r) => ({ scenario: r.result.scenario, reason: r.validation.suspiciousReason ?? '', excerpt: (r.validation.answerText ?? '').slice(0,160) }));
+
+  const salesMetrics = {
+    conversationCompletionRate: conversationMetrics.length ? conversationMetrics.reduce((a, b) => a + b.completionRate, 0) / conversationMetrics.length : 0,
+    contradictionRate: conversationMetrics.length ? conversationMetrics.reduce((a, b) => a + b.consistencyViolations, 0) / Math.max(1, conversationMetrics.reduce((a,b)=>a+b.totalTurns,0)) : 0,
+    fitmentClarificationRate: fitmentRows.length ? fitmentRows.filter((r) => r.salesSignals.askedClarifyingQuestion).length / fitmentRows.length : 0,
+    purchaseGuidanceRate: purchaseRows.length ? purchaseRows.filter((r) => r.salesSignals.hasCommercialCta || !r.salesSignals.tooGeneric).length / purchaseRows.length : 0,
+    ctaPresenceRate: allRows.filter((r) => r.salesSignals.hasCommercialCta).length / total,
+    earlyRecommendationRate: allRows.filter((r) => r.salesSignals.earlyRecommendation).length / total,
+    tooGenericRate: allRows.filter((r) => r.salesSignals.tooGeneric).length / total,
+    unsafeFitmentRate: allRows.filter((r) => r.salesSignals.potentialUnsafeFitment).length / total,
+    suspiciousResponseRate: suspiciousRows.length / total,
+  };
+
+  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, salesMetrics, breakpoint });
+  writeJson(path.join(config.outputDir, 'scenario-metrics.json'), scenarioMetrics);
   writeJson(path.join(config.outputDir, 'conversation-metrics.json'), conversationMetrics);
-  writeCsv(config.outputDir, metrics);
-  writeHumanHtml(config.outputDir, summary, metrics);
-  writeConversationMarkdown(config.outputDir, conversationMetrics);
-  writeDashboard(config.outputDir, summary, metrics, breakpoint.steps);
+  writeJson(path.join(config.outputDir, 'sales-metrics.json'), salesMetrics);
+  writeCsv(config.outputDir, scenarioMetrics);
 
-  if (breakpoint.steps.length) {
-    writeJson(path.join(config.outputDir, 'breakpoint-summary.json'), breakpoint);
-    writeJson(path.join(config.outputDir, 'breakpoint-steps.json'), breakpoint.steps);
-    fs.writeFileSync(path.join(config.outputDir, 'breakpoint-summary.md'), breakpointMarkdown, 'utf8');
-  }
+  const reportHtml = `<html><body><h1>Scenario Metrics</h1><table border="1"><tr><th>Scenario</th><th>Total</th><th>Success%</th><th>p95</th><th>Failures</th></tr>${scenarioMetrics.map(m=>`<tr><td>${m.name}</td><td>${m.total}</td><td>${(m.successRate*100).toFixed(1)}</td><td>${m.p95}</td><td>${m.failures}</td></tr>`).join('')}</table></body></html>`;
+  fs.writeFileSync(path.join(config.outputDir, 'report.html'), reportHtml, 'utf8');
+
+  renderStaticDashboard(config.outputDir, summary, scenarioMetrics, salesMetrics, breakpoint.steps, suspiciousRows.slice(0, 12));
+  writeExecutiveSummary(config.outputDir, summary, salesMetrics, scenarioMetrics, breakpoint);
 
   console.log('=== Chatbot Stress Summary ===');
   console.log(`Profile: ${config.profile}`);
-  console.log(`Total requests: ${summary.totals.total}`);
   console.log(`Success rate: ${(summary.successRate * 100).toFixed(2)}%`);
-  console.log(`Warn count: ${summary.totals.warns}`);
-  console.log(`Hard failures: ${summary.totals.failures}`);
-  console.log(`Timeouts: ${summary.totals.timeouts}`);
-  console.log(`Non-200: ${summary.totals.non200}`);
-  console.log(`Conversation scenarios: ${conversationMetrics.length}`);
+  console.log(`Purchase guidance rate: ${(salesMetrics.purchaseGuidanceRate * 100).toFixed(2)}%`);
+  console.log(`Fitment clarification rate: ${(salesMetrics.fitmentClarificationRate * 100).toFixed(2)}%`);
   console.log(`Dashboard: ${path.join(config.outputDir, 'dashboard.html')}`);
-
-  if (breakpoint.steps.length) {
-    console.log('=== Breakpoint Discovery ===');
-    console.log(`Best stable concurrency: ${breakpoint.bestStableConcurrency}`);
-    console.log(`First unstable concurrency: ${breakpoint.firstUnstableConcurrency ?? 'not reached'}`);
-    console.log(`Interpretation file: ${path.join(config.outputDir, 'breakpoint-summary.md')}`);
-  }
 }

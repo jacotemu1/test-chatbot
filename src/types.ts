@@ -122,6 +122,14 @@ export interface ConversationRunMetrics {
   unstableRephraseCount: number;
 }
 
+export interface SalesSignals {
+  askedClarifyingQuestion: boolean;
+  earlyRecommendation: boolean;
+  hasCommercialCta: boolean;
+  tooGeneric: boolean;
+  potentialUnsafeFitment: boolean;
+}
+
 export interface ScenarioMetrics {
   name: string;
   total: number;
