@@ -1,0 +1,60 @@
+name: Smoke Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (ubuntu-latest or self-hosted)'
+        required: false
+        default: 'ubuntu-latest'
+
+jobs:
+  smoke:
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CHATBOT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      CHATBOT_URL: ${{ secrets.CHATBOT_URL }}
+      CHATBOT_AUTH_TOKEN: ${{ secrets.CHATBOT_AUTH_TOKEN }}
+      CHATBOT_TIMEOUT_MS: ${{ vars.CHATBOT_TIMEOUT_MS || '10000' }}
+      CHATBOT_MAX_CONCURRENCY: '2'
+      CHATBOT_RAMP_STEPS: '2'
+      CHATBOT_TOTAL_REQUESTS: '20'
+      CHATBOT_OUTPUT_DIR: reports
+      CHATBOT_PROFILE: light
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Endpoint reachability note
+        run: |
+          echo "Note: GitHub-hosted runners may not reach internal endpoint."
+          echo "Set repository variable CHATBOT_RUNNER=self-hosted to run inside corporate network."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright deps
+        run: npx playwright install --with-deps
+
+      - name: Run smoke harness
+        run: npm test
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f reports/job-summary.md ]; then
+            cat reports/job-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-reports-${{ github.run_id }}
+          path: reports/
