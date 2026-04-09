@@ -1,0 +1,131 @@
+name: Nightly Medium Stress
+
+on:
+  schedule:
+    - cron: '15 1 * * *'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (ubuntu-latest or self-hosted)'
+        required: false
+        default: 'ubuntu-latest'
+
+jobs:
+  nightly:
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CHATBOT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    env:
+      CHATBOT_PROFILE: medium
+      CHATBOT_URL: ${{ secrets.CHATBOT_URL }}
+      CHATBOT_AUTH_TOKEN: ${{ secrets.CHATBOT_AUTH_TOKEN }}
+      CHATBOT_TIMEOUT_MS: ${{ vars.CHATBOT_TIMEOUT_MS || '15000' }}
+      CHATBOT_MAX_CONCURRENCY: ${{ vars.CHATBOT_MAX_CONCURRENCY || '10' }}
+      CHATBOT_RAMP_STEPS: ${{ vars.CHATBOT_RAMP_STEPS || '6' }}
+      CHATBOT_TOTAL_REQUESTS: ${{ vars.CHATBOT_TOTAL_REQUESTS || '180' }}
+      CHATBOT_OUTPUT_DIR: reports
+      MAX_SUCCESS_RATE_DROP: ${{ vars.MAX_SUCCESS_RATE_DROP || '0.05' }}
+      MAX_FAILURE_RATE_INCREASE: ${{ vars.MAX_FAILURE_RATE_INCREASE || '0.05' }}
+      MAX_TIMEOUT_RATE_INCREASE: ${{ vars.MAX_TIMEOUT_RATE_INCREASE || '0.03' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Endpoint reachability note
+        run: |
+          echo "Nightly requires internal network path."
+          echo "Set CHATBOT_RUNNER=self-hosted for reliable connectivity."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Restore previous baseline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .baseline
+          key: nightly-summary-${{ github.run_id }}
+          restore-keys: |
+            nightly-summary-
+
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npm test
+
+      - name: Compare with previous run (if available)
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          current = Path('reports/summary.json')
+          previous = Path('.baseline/summary.json')
+
+          if not current.exists():
+            print('Missing reports/summary.json')
+            sys.exit(1)
+
+          cur = json.loads(current.read_text())
+          if not previous.exists():
+            print('No previous baseline found. Skipping regression gate for this run.')
+            sys.exit(0)
+
+          prev = json.loads(previous.read_text())
+
+          def ratio(summary, key):
+            total = max(1, summary['totals']['total'])
+            return summary['totals'][key] / total
+
+          success_drop = prev.get('successRate', 0) - cur.get('successRate', 0)
+          failure_rate_increase = ratio(cur, 'failures') - ratio(prev, 'failures')
+          timeout_rate_increase = ratio(cur, 'timeouts') - ratio(prev, 'timeouts')
+
+          print(f"success_drop={success_drop:.4f}")
+          print(f"failure_rate_increase={failure_rate_increase:.4f}")
+          print(f"timeout_rate_increase={timeout_rate_increase:.4f}")
+
+          max_success_drop = float(os.environ['MAX_SUCCESS_RATE_DROP'])
+          max_failure_increase = float(os.environ['MAX_FAILURE_RATE_INCREASE'])
+          max_timeout_increase = float(os.environ['MAX_TIMEOUT_RATE_INCREASE'])
+
+          hard_fail = False
+          if success_drop > max_success_drop:
+            print(f"HARD REGRESSION: success rate dropped by {success_drop:.4f}")
+            hard_fail = True
+          if failure_rate_increase > max_failure_increase:
+            print(f"HARD REGRESSION: failure rate increased by {failure_rate_increase:.4f}")
+            hard_fail = True
+          if timeout_rate_increase > max_timeout_increase:
+            print(f"HARD REGRESSION: timeout rate increased by {timeout_rate_increase:.4f}")
+            hard_fail = True
+
+          if hard_fail:
+            sys.exit(2)
+          PY
+
+      - name: Save current run as baseline
+        if: always()
+        run: |
+          mkdir -p .baseline
+          cp reports/summary.json .baseline/summary.json
+
+      - name: Persist baseline cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .baseline
+          key: nightly-summary-${{ github.run_id }}
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f reports/job-summary.md ]; then
+            cat reports/job-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-medium-${{ github.run_id }}
+          path: reports/

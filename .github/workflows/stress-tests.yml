@@ -1,0 +1,69 @@
+name: Stress Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Stress profile'
+        required: true
+        default: 'light'
+        type: choice
+        options:
+          - light
+          - medium
+          - heavy
+          - breakpoint
+      runner:
+        description: 'Runner label (ubuntu-latest or self-hosted)'
+        required: false
+        default: 'ubuntu-latest'
+
+jobs:
+  stress:
+    runs-on: ${{ inputs.runner || vars.CHATBOT_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    env:
+      CHATBOT_PROFILE: ${{ inputs.profile }}
+      CHATBOT_URL: ${{ secrets.CHATBOT_URL }}
+      CHATBOT_AUTH_TOKEN: ${{ secrets.CHATBOT_AUTH_TOKEN }}
+      CHATBOT_TIMEOUT_MS: ${{ vars.CHATBOT_TIMEOUT_MS || '15000' }}
+      CHATBOT_MAX_CONCURRENCY: ${{ vars.CHATBOT_MAX_CONCURRENCY || '8' }}
+      CHATBOT_RAMP_STEPS: ${{ vars.CHATBOT_RAMP_STEPS || '6' }}
+      CHATBOT_TOTAL_REQUESTS: ${{ vars.CHATBOT_TOTAL_REQUESTS || '120' }}
+      CHATBOT_OUTPUT_DIR: reports
+      CHATBOT_BREAKPOINT_MAX_P95_MS: ${{ vars.CHATBOT_BREAKPOINT_MAX_P95_MS || '2500' }}
+      CHATBOT_BREAKPOINT_MAX_TIMEOUT_RATE: ${{ vars.CHATBOT_BREAKPOINT_MAX_TIMEOUT_RATE || '0.03' }}
+      CHATBOT_BREAKPOINT_MAX_ERROR_RATE: ${{ vars.CHATBOT_BREAKPOINT_MAX_ERROR_RATE || '0.05' }}
+      CHATBOT_BREAKPOINT_MAX_EMPTY_RATE: ${{ vars.CHATBOT_BREAKPOINT_MAX_EMPTY_RATE || '0.05' }}
+      CHATBOT_BREAKPOINT_MAX_SCHEMA_DRIFT_RATE: ${{ vars.CHATBOT_BREAKPOINT_MAX_SCHEMA_DRIFT_RATE || '0.05' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Endpoint reachability note
+        run: |
+          echo "Internal endpoint might be unreachable from GitHub-hosted runners."
+          echo "Use input runner=self-hosted (or set CHATBOT_RUNNER var) for internal network access."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      - run: npx playwright install --with-deps
+      - run: npm test
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f reports/job-summary.md ]; then
+            cat reports/job-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-${{ inputs.profile }}-${{ github.run_id }}
+          path: reports/
