@@ -13,24 +13,46 @@ import { BreakpointStepMetrics, ConversationRunMetrics, ConversationScenario, Ha
 import { buildScenarios, profileOverrides } from '../scenarios';
 import { buildConversationScenarios } from '../scenarios/conversations';
 
+type FailureBucket =
+  | 'endpoint_unreachable'
+  | 'dns_or_network_failure'
+  | 'auth_failure'
+  | 'non_200_http_response'
+  | 'invalid_json_response'
+  | 'empty_body'
+  | 'empty_answer_field'
+  | 'renderer_failure'
+  | 'screenshot_generation_failure'
+  | 'chatbot_quality_failure';
+
 type ScenarioRow = EvaluatedResult & {
+  payload: Record<string, unknown>;
   prompt: string;
   answer: string;
+  hasUsableAnswer: boolean;
   salesSignals: ReturnType<typeof evaluateSalesSignals>;
-  categories: string[];
+  qualityCategories: string[];
+  failureBucket: FailureBucket | null;
+  reason: string;
 };
 
-type TranscriptTurn = { role: 'user' | 'bot'; text: string; timestamp: string; latencyMs?: number; result?: 'pass'|'warn'|'fail'; issues?: string[] };
 type Transcript = {
   id: string;
   scenarioId: string;
   scenarioCategory: string;
-  startedAt: string;
-  result: 'pass'|'warn'|'fail';
+  result: 'pass' | 'warn' | 'fail';
   issues: string[];
-  userTurns: number;
-  botTurns: number;
-  turns: TranscriptTurn[];
+  prompt: string;
+  answer: string;
+  latencyMs: number;
+  status?: number;
+  failureBucket?: FailureBucket | null;
+  requestPayload: unknown;
+  responseHeaders?: Record<string, string>;
+  rawResponse?: string;
+  parsedResponse?: unknown;
+  error?: string;
+  reason?: string;
 };
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
@@ -39,92 +61,118 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return chunks;
 }
 
-function hardFailure(result: ScenarioRow['result']): boolean {
-  return !!result.error || result.timedOut || (result.status ?? 0) !== 200;
+function classifyTechnicalFailure(row: {
+  status?: number;
+  error?: string;
+  rawBody?: string;
+  parsedBody?: unknown;
+  answer: string;
+}): { bucket: FailureBucket | null; reason: string } {
+  const err = (row.error || '').toLowerCase();
+
+  if (err.includes('enotfound') || err.includes('dns')) {
+    return { bucket: 'dns_or_network_failure', reason: 'DNS/network resolution failure' };
+  }
+  if (err.includes('econnrefused') || err.includes('fetch failed') || err.includes('network')) {
+    return { bucket: 'endpoint_unreachable', reason: 'Endpoint unreachable or connection refused' };
+  }
+  if (row.status === 401 || row.status === 403) {
+    return { bucket: 'auth_failure', reason: 'Authentication/authorization failure' };
+  }
+  if ((row.status ?? 0) !== 200) {
+    return { bucket: 'non_200_http_response', reason: `HTTP status ${row.status ?? 'unknown'}` };
+  }
+  if (!row.rawBody || !row.rawBody.trim()) {
+    return { bucket: 'empty_body', reason: 'HTTP 200 but empty raw body' };
+  }
+  if (!row.parsedBody) {
+    return { bucket: 'invalid_json_response', reason: 'Response body not parseable as JSON' };
+  }
+  if (!row.answer.trim()) {
+    return { bucket: 'empty_answer_field', reason: 'Parsed response found but answer field empty/unmapped' };
+  }
+  return { bucket: null, reason: 'usable_answer' };
 }
 
-function saveTranscriptArtifacts(baseDir: string, transcript: Transcript): { htmlPath: string; jsonPath: string; mdPath: string } {
-  const convoDir = path.join(baseDir, 'conversations');
-  ensureDir(convoDir);
+function saveTranscriptArtifacts(baseDir: string, t: Transcript): string {
+  const dir = path.join(baseDir, 'conversations');
+  ensureDir(dir);
+  const safe = t.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const jsonPath = path.join(dir, `${safe}.json`);
+  const htmlPath = path.join(dir, `${safe}.html`);
+  writeJson(jsonPath, t);
 
-  const safe = transcript.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const jsonPath = path.join(convoDir, `${safe}.json`);
-  const mdPath = path.join(convoDir, `${safe}.md`);
-  const htmlPath = path.join(convoDir, `${safe}.html`);
+  const noAnswerBanner = !t.answer.trim()
+    ? '<div class="banner">No usable chatbot response captured</div>'
+    : '';
 
-  writeJson(jsonPath, transcript);
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${t.id}</title>
+  <style>body{font-family:Arial;margin:20px}.banner{background:#ffe6e6;border:2px solid #d33;padding:10px;margin-bottom:10px;font-weight:bold}.bubble{padding:10px;border-radius:10px;margin:10px 0}.user{background:#e8f0ff}.bot{background:#f2f2f2}.fail{border:2px solid #d33}.meta{font-size:12px;color:#666}pre{background:#fafafa;border:1px solid #ddd;padding:10px;overflow:auto}</style></head><body>
+  <h1>${t.scenarioId}</h1>
+  <p>Result: <b>${t.result}</b> | Bucket: ${t.failureBucket ?? 'none'} | Reason: ${t.reason}</p>
+  ${noAnswerBanner}
+  <div class="bubble user"><div class="meta">USER</div>${t.prompt}</div>
+  <div class="bubble bot ${t.result !== 'pass' ? 'fail' : ''}"><div class="meta">BOT • ${t.latencyMs}ms • status ${t.status ?? 'n/a'}</div>${t.answer || '[empty]'}</div>
+  <h2>Transport evidence</h2>
+  <pre>Request payload:\n${JSON.stringify(t.requestPayload, null, 2)}</pre>
+  <pre>Response headers:\n${JSON.stringify(t.responseHeaders ?? {}, null, 2)}</pre>
+  <pre>Raw response:\n${(t.rawResponse ?? '').slice(0, 5000)}</pre>
+  <pre>Parsed response:\n${JSON.stringify(t.parsedResponse ?? null, null, 2)}</pre>
+  <pre>Error:\n${t.error ?? ''}</pre>
+  <p>${!t.answer.trim() ? 'Screenshot/report is limited because no usable answer exists.' : ''}</p>
+  </body></html>`;
 
-  const md = [
-    `# Conversation ${transcript.id}`,
-    `- Scenario: ${transcript.scenarioId}`,
-    `- Category: ${transcript.scenarioCategory}`,
-    `- Result: ${transcript.result}`,
-    `- Issues: ${transcript.issues.join(', ') || 'none'}`,
-    '',
-    ...transcript.turns.map((t) => `**${t.role.toUpperCase()}** (${t.timestamp})${t.latencyMs ? ` [${t.latencyMs}ms]` : ''}: ${t.text}`),
-  ].join('\n');
-  fs.writeFileSync(mdPath, md, 'utf8');
-
-  const bubbles = transcript.turns.map((t) => {
-    const cls = t.role === 'user' ? 'user' : 'bot';
-    const suspicious = t.issues && t.issues.length ? ' suspicious' : '';
-    const issues = t.issues?.length ? `<div class="issues">Issues: ${t.issues.join(', ')}</div>` : '';
-    return `<div class="bubble ${cls}${suspicious}"><div class="meta">${t.role.toUpperCase()} • ${t.timestamp}${t.latencyMs ? ` • ${t.latencyMs}ms` : ''}${t.result ? ` • ${t.result}` : ''}</div><div>${t.text || '[empty]'}</div>${issues}</div>`;
-  }).join('');
-
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${transcript.id}</title>
-  <style>body{font-family:Arial;margin:20px}.meta{font-size:12px;color:#666}.bubble{padding:10px;border-radius:10px;margin:8px 0;max-width:900px}.user{background:#e8f0ff}.bot{background:#f2f2f2}.suspicious{border:2px solid #d33}.issues{margin-top:6px;color:#b30000;font-size:12px}</style></head>
-  <body><h1>${transcript.scenarioId}</h1><p>Result: <b>${transcript.result}</b> | Category: ${transcript.scenarioCategory} | Issues: ${transcript.issues.join(', ') || 'none'}</p>${bubbles}</body></html>`;
   fs.writeFileSync(htmlPath, html, 'utf8');
-
-  return { htmlPath, jsonPath, mdPath };
+  return htmlPath;
 }
 
-async function captureScreenshots(baseDir: string, pages: Array<{ id: string; result: 'pass'|'warn'|'fail'; htmlPath: string }>): Promise<string[]> {
-  const shotDir = path.join(baseDir, 'screenshots');
-  ensureDir(shotDir);
-
-  const picked = pages.filter((p) => p.result !== 'pass');
-  const passSample = pages.filter((p) => p.result === 'pass').slice(0, 3);
-  const targets = [...picked, ...passSample];
-
+async function captureScreenshots(baseDir: string, pages: Array<{ id: string; result: 'pass'|'warn'|'fail'; htmlPath: string }>): Promise<{ files: string[]; failed: number }> {
+  const dir = path.join(baseDir, 'screenshots');
+  ensureDir(dir);
+  const targets = [...pages.filter((p) => p.result !== 'pass'), ...pages.filter((p) => p.result === 'pass').slice(0, 3)];
   const files: string[] = [];
-  if (!targets.length) return files;
+  let failed = 0;
+  if (!targets.length) return { files, failed };
 
   try {
     const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 1800 } });
     for (const t of targets) {
-      const out = path.join(shotDir, `${t.id}__${t.result}.png`);
-      await page.goto(`file://${t.htmlPath}`);
-      await page.screenshot({ path: out, fullPage: true });
-      files.push(out);
+      try {
+        const out = path.join(dir, `${t.id}__${t.result}.png`);
+        await page.goto(`file://${t.htmlPath}`);
+        await page.screenshot({ path: out, fullPage: true });
+        files.push(out);
+      } catch {
+        failed += 1;
+      }
     }
     await browser.close();
   } catch {
-    // keep run resilient if screenshoting is unavailable
+    failed += targets.length;
   }
 
-  return files;
+  return { files, failed };
 }
 
 async function runScenario(client: ChatbotClient, scenario: ScenarioDefinition): Promise<ScenarioRow[]> {
-  const batches = chunkArray(scenario.requests, Math.max(1, scenario.concurrency));
   const rows: ScenarioRow[] = [];
-
-  for (const batch of batches) {
+  for (const batch of chunkArray(scenario.requests, Math.max(1, scenario.concurrency))) {
     const settled = await Promise.all(batch.map((payload) => client.send(payload, scenario.name, scenario.timeoutMs)));
-    settled.forEach((result, idx) => {
-      const prompt = String(batch[idx].input ?? '');
+    settled.forEach((result, i) => {
+      const payload = batch[i] as Record<string, unknown>;
+      const prompt = String(payload.input ?? '');
       const validation = validateResult(result, scenario.validation);
       const answer = validation.answerText ?? result.rawBody ?? '';
-      const salesSignals = evaluateSalesSignals(prompt, answer);
-      const categories = categorizeFailure({
-        validation,
-        sales: salesSignals,
-        isTechnicalFailure: !!result.error || result.timedOut || (result.status ?? 0) !== 200,
-      });
-      rows.push({ result, validation, prompt, answer, salesSignals, categories });
+      const technical = classifyTechnicalFailure({ status: result.status, error: result.error, rawBody: result.rawBody, parsedBody: result.parsedBody, answer });
+      const hasUsableAnswer = technical.bucket === null;
+      const salesSignals = hasUsableAnswer
+        ? evaluateSalesSignals(prompt, answer)
+        : { askedClarifyingQuestion: false, earlyRecommendation: false, hasCommercialCta: false, tooGeneric: false, potentialUnsafeFitment: false };
+      const qualityCategories = hasUsableAnswer
+        ? categorizeFailure({ validation, sales: salesSignals, isTechnicalFailure: false })
+        : [];
+      rows.push({ result, validation, payload, prompt, answer, hasUsableAnswer, salesSignals, qualityCategories, failureBucket: technical.bucket, reason: technical.reason });
     });
   }
   return rows;
@@ -132,32 +180,24 @@ async function runScenario(client: ChatbotClient, scenario: ScenarioDefinition):
 
 async function runConversationScenario(client: ChatbotClient, scenario: ConversationScenario): Promise<ConversationRunMetrics> {
   const history: Array<{ role: string; content: string }> = [];
-  const turns: Array<{ turnId: string; answer: string; latencyMs: number; ok: boolean }> = [];
+  const latencies: number[] = [];
 
   for (const turn of scenario.turns) {
     const result = await client.send({ input: turn.userPrompt, context: history }, `conversation-${scenario.name}`);
     const validation = validateResult(result, { mode: 'consistency_check', expectedKeywords: turn.expectKeywords });
     const answer = validation.answerText ?? result.rawBody ?? '';
-    turns.push({
-      turnId: turn.id,
-      answer,
-      latencyMs: result.latencyMs,
-      ok: !result.error && !result.timedOut && (result.status ?? 0) === 200 && validation.score !== 'fail',
-    });
+    latencies.push(result.latencyMs);
     history.push({ role: 'user', content: turn.userPrompt });
     history.push({ role: 'assistant', content: answer || '[empty]' });
   }
 
   const totalTurns = scenario.turns.length;
-  const completedTurns = turns.filter((t) => t.ok).length;
+  const completedTurns = latencies.length;
   const completionRate = totalTurns ? completedTurns / totalTurns : 0;
-  const turnLatenciesMs = turns.map((t) => t.latencyMs);
-  const avgTurnLatencyMs = turnLatenciesMs.length
-    ? turnLatenciesMs.reduce((a, b) => a + b, 0) / turnLatenciesMs.length
-    : 0;
-  const split = Math.max(1, Math.floor(turnLatenciesMs.length * 0.3));
-  const early = turnLatenciesMs.slice(0, split);
-  const late = turnLatenciesMs.slice(-split);
+  const avgTurnLatencyMs = latencies.length ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
+  const split = Math.max(1, Math.floor(latencies.length * 0.3));
+  const early = latencies.slice(0, split);
+  const late = latencies.slice(-split);
   const earlyAvg = early.length ? early.reduce((a, b) => a + b, 0) / early.length : 1;
   const lateAvg = late.length ? late.reduce((a, b) => a + b, 0) / late.length : earlyAvg;
 
@@ -166,7 +206,7 @@ async function runConversationScenario(client: ChatbotClient, scenario: Conversa
     totalTurns,
     completedTurns,
     completionRate,
-    turnLatenciesMs,
+    turnLatenciesMs: latencies,
     avgTurnLatencyMs,
     lateTurnLatencyGrowthRatio: earlyAvg > 0 ? lateAvg / earlyAvg : 1,
     consistencyViolations: 0,
@@ -187,7 +227,6 @@ function aggregateSummary(metrics: ScenarioMetrics[]) {
     acc.schemaDrift += m.schemaDriftCount;
     return acc;
   }, { total: 0, failures: 0, warns: 0, timeouts: 0, non200: 0, parseFailures: 0, empty: 0, schemaDrift: 0 });
-
   return { generatedAt: new Date().toISOString(), totals, successRate: totals.total ? (totals.total - totals.failures) / totals.total : 0, scenarios: metrics.length };
 }
 
@@ -217,50 +256,65 @@ async function runBreakpointSearch(baseConfig: HarnessConfig): Promise<{ steps: 
   const stepSize = Math.max(1, Math.floor(baseConfig.maxConcurrency / baseConfig.rampSteps));
   let bestStableConcurrency = 0;
   let firstUnstableConcurrency: number | null = null;
-
   for (let concurrency = 1; concurrency <= baseConfig.maxConcurrency; concurrency += stepSize) {
     const client = new ChatbotClient({ ...baseConfig, maxConcurrency: concurrency });
-    const requests = Array.from({ length: Math.max(40, Math.floor(baseConfig.totalRequests / 2)) }, (_, i) => ({ input: `Breakpoint probe #${i} for tyre recommendation and safe fitment.` }));
-    const rows = await runScenario(client, { name: `breakpoint-${concurrency}`, requests, concurrency, validation: { mode: 'non_empty' } });
-    const metrics = computeScenarioMetrics(`breakpoint-${concurrency}`, rows);
-    const step = evaluateBreakpointStep(metrics, concurrency, baseConfig);
+    const reqs = Array.from({ length: Math.max(40, Math.floor(baseConfig.totalRequests / 2)) }, (_, i) => ({ input: `Breakpoint probe #${i} for tyre recommendation.` }));
+    const rows = await runScenario(client, { name: `breakpoint-${concurrency}`, requests: reqs, concurrency, validation: { mode: 'non_empty' } });
+    const m = computeScenarioMetrics(`breakpoint-${concurrency}`, rows);
+    const step = evaluateBreakpointStep(m, concurrency, baseConfig);
     steps.push(step);
     if (step.healthy) bestStableConcurrency = concurrency; else { firstUnstableConcurrency = concurrency; break; }
   }
   return { steps, bestStableConcurrency, firstUnstableConcurrency };
 }
 
-function buildMainReport(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], sales: Record<string, number>, topCategories: Array<[string, number]>, topScenarios: ScenarioMetrics[], transcripts: Transcript[], screenshots: string[]): void {
+function buildTechnicalReport(outputDir: string, examples: Transcript[], bucketCounts: Record<string, number>): void {
+  const rows = examples.slice(0, 20).map((e) => `<tr><td>${e.scenarioId}</td><td>${e.failureBucket}</td><td>${e.reason}</td><td>${e.status ?? 'n/a'}</td><td><pre>${JSON.stringify(e.requestPayload, null, 2)}</pre></td><td><pre>${(e.rawResponse ?? '').slice(0, 300)}</pre></td></tr>`).join('');
+  const hints = [
+    'endpoint URL mismatch',
+    'missing auth header',
+    'wrong request payload shape',
+    'incorrect response field mapping',
+    'environment/network issue',
+    'self-hosted runner / internal DNS reachability problem',
+  ];
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Technical Failures</title><style>body{font-family:Arial;margin:20px} table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px;vertical-align:top}pre{white-space:pre-wrap}</style></head><body>
+  <h1>Technical Failure Report</h1>
+  <h2>Summary by type</h2><pre>${JSON.stringify(bucketCounts, null, 2)}</pre>
+  <h2>First 20 examples</h2><table><tr><th>Scenario</th><th>Bucket</th><th>Reason</th><th>HTTP</th><th>Request</th><th>Raw response</th></tr>${rows}</table>
+  <h2>First things to check</h2><ul>${hints.map((h) => `<li>${h}</li>`).join('')}</ul>
+  </body></html>`;
+  ensureDir(path.join(outputDir, 'report'));
+  fs.writeFileSync(path.join(outputDir, 'report', 'technical.html'), html, 'utf8');
+}
+
+function buildMainReport(outputDir: string, summary: ReturnType<typeof aggregateSummary>, scenarioMetrics: ScenarioMetrics[], sales: Record<string, number>, transcripts: Transcript[], screenshots: string[], bucketCounts: Record<string, number>): void {
   const reportDir = path.join(outputDir, 'report');
   ensureDir(reportDir);
 
-  const rows = scenarioMetrics.map((m) => `<tr><td>${m.name}</td><td>${m.total}</td><td>${(m.successRate*100).toFixed(1)}%</td><td>${m.p95}</td><td>${m.failures}</td></tr>`).join('');
-  const catRows = topCategories.map(([k,v]) => `<li>${k}: ${v}</li>`).join('');
-  const topScenarioRows = topScenarios.map((s)=>`<li>${s.name} (${s.failures}/${s.total})</li>`).join('');
+  const total = Math.max(1, transcripts.length);
+  const technicalCount = transcripts.filter((t) => t.failureBucket && t.failureBucket !== 'chatbot_quality_failure').length;
+  const unusableCount = transcripts.filter((t) => t.failureBucket === 'empty_body' || t.failureBucket === 'empty_answer_field').length;
+  const qualityFails = transcripts.filter((t) => t.failureBucket === 'chatbot_quality_failure');
 
-  const transcriptRows = transcripts.slice(0, 120).map((t) => {
-    const page = `../conversations/${t.id}.html`;
+  const evidenceRows = transcripts.slice(0, 120).map((t) => {
     const shot = screenshots.find((s) => path.basename(s).startsWith(t.id));
-    const thumb = shot ? `<img src="../screenshots/${path.basename(shot)}" style="width:220px;border:1px solid #ccc"/>` : '';
-    return `<tr><td><a href="${page}">${t.id}</a></td><td>${t.scenarioId}</td><td>${t.result}</td><td>${t.issues.join(', ')}</td><td>${thumb}</td></tr>`;
+    const shotLink = shot ? `<a href="../screenshots/${path.basename(shot)}">screenshot</a>` : '-';
+    return `<tr><td>${t.scenarioId}</td><td>${t.prompt.slice(0,120)}</td><td>${t.status ?? 'n/a'}</td><td>${t.answer.length}</td><td>${t.failureBucket ?? 'none'}</td><td>${t.reason}</td><td><a href="../conversations/${t.id}.html">transcript</a></td><td>${shotLink}</td></tr>`;
   }).join('');
 
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Investigation Report</title><style>body{font-family:Arial;margin:20px} .cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px} .card{border:1px solid #ddd;padding:10px;border-radius:8px} table{border-collapse:collapse;width:100%;margin-top:10px} th,td{border:1px solid #ddd;padding:6px;vertical-align:top}</style></head><body>
-<h1>Chatbot Investigation Report</h1>
-<div class="cards"><div class="card"><b>Total</b><br>${summary.totals.total}</div><div class="card"><b>Success</b><br>${(summary.successRate*100).toFixed(2)}%</div><div class="card"><b>Warn</b><br>${summary.totals.warns}</div><div class="card"><b>Fail</b><br>${summary.totals.failures}</div></div>
-<h2>Top failing categories</h2><ul>${catRows}</ul>
-<h2>Top failing scenarios</h2><ul>${topScenarioRows}</ul>
-<h2>Latency overview</h2><p>Timeout rate ${(summary.totals.timeouts/Math.max(1,summary.totals.total)*100).toFixed(2)}% • Non-200 ${summary.totals.non200}</p>
-<h2>Commercial progression issues</h2><ul><li>CTA presence rate: ${(sales.ctaPresenceRate*100).toFixed(2)}%</li><li>Purchase guidance rate: ${(sales.purchaseGuidanceRate*100).toFixed(2)}%</li><li>No CTA/next step rate: ${(sales.noCtaRate*100).toFixed(2)}%</li></ul>
-<h2>Fitment-flow issues</h2><ul><li>Fitment clarification rate: ${(sales.fitmentClarificationRate*100).toFixed(2)}%</li><li>Unsafe fitment rate: ${(sales.unsafeFitmentRate*100).toFixed(2)}%</li><li>Premature recommendation rate: ${(sales.earlyRecommendationRate*100).toFixed(2)}%</li></ul>
-<h2>Where the bot does not understand the user</h2><p>Keyword miss and misunderstood_intent patterns are summarized in failure categories and transcript issue tags.</p>
-<h2>Where the bot goes off-track</h2><p>See categories irrelevant_answer, contradiction, unstable_repeated_answer and transcript pages.</p>
-<h2>Where the bot fails commercially</h2><p>See no_cta_or_next_step, generic_non_answer, and low purchase-guidance rate.</p>
-<h2>Where the bot becomes unreliable under stress</h2><p>See timeout_or_technical_failure rates and breakpoint summary in summary.json.</p>
-<h2>Scenario metrics</h2><table><tr><th>Scenario</th><th>Total</th><th>Success</th><th>p95</th><th>Failures</th></tr>${rows}</table>
-<h2>Conversation pages</h2><table><tr><th>Transcript</th><th>Scenario</th><th>Result</th><th>Issues</th><th>Screenshot</th></tr>${transcriptRows}</table>
-</body></html>`;
-
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Investigation Report</title><style>body{font-family:Arial;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px;vertical-align:top}</style></head><body>
+  <h1>Chatbot Investigation Report</h1>
+  <p>Success ${(summary.successRate*100).toFixed(2)}% | Warn ${summary.totals.warns} | Fail ${summary.totals.failures}</p>
+  <h2>System / endpoint failures</h2><p>${technicalCount}/${total} conversations are technical failures.</p><pre>${JSON.stringify(bucketCounts, null, 2)}</pre>
+  <h2>Empty or unusable responses</h2><p>${unusableCount}/${total} conversations have empty body/answer.</p>
+  <h2>Real chatbot misunderstandings</h2><p>${qualityFails.filter((t)=>t.issues.includes('misunderstood_intent')).length} detected with valid answers.</p>
+  <h2>Commercial failures with valid answers</h2><p>No CTA rate ${(sales.noCtaRate*100).toFixed(2)}%, purchase guidance ${(sales.purchaseGuidanceRate*100).toFixed(2)}%.</p>
+  <h2>Fitment failures with valid answers</h2><p>Fitment clarification ${(sales.fitmentClarificationRate*100).toFixed(2)}%, unsafe fitment ${(sales.unsafeFitmentRate*100).toFixed(2)}%.</p>
+  <h2>Evidence table</h2>
+  <table><tr><th>Scenario</th><th>Prompt</th><th>HTTP status</th><th>Answer length</th><th>Failure bucket</th><th>Short reason</th><th>Transcript</th><th>Screenshot</th></tr>${evidenceRows}</table>
+  <p><a href="technical.html">Open technical failure report</a></p>
+  </body></html>`;
   fs.writeFileSync(path.join(reportDir, 'index.html'), html, 'utf8');
 }
 
@@ -280,47 +334,51 @@ export async function runHarness(): Promise<void> {
   const scenarioMetrics: ScenarioMetrics[] = [];
   const allRows: ScenarioRow[] = [];
   const transcripts: Transcript[] = [];
-  const pageRefs: Array<{ id: string; result: 'pass'|'warn'|'fail'; htmlPath: string }> = [];
+  const pages: Array<{ id: string; result: 'pass'|'warn'|'fail'; htmlPath: string }> = [];
 
   for (const scenario of scenarios) {
     const rows = await runScenario(client, scenario);
     allRows.push(...rows);
 
     rows.forEach((row, idx) => {
-      const techFail = hardFailure(row.result);
-      const resultLabel: 'pass'|'warn'|'fail' = techFail || row.validation.score === 'fail' ? 'fail' : row.validation.score === 'warn' ? 'warn' : 'pass';
-      const issues = [...new Set([...(row.categories || []), ...(row.validation.suspiciousReason ? [row.validation.suspiciousReason] : [])])];
-
+      const resultLabel: 'pass'|'warn'|'fail' = row.failureBucket ? 'fail' : row.qualityCategories.length ? 'warn' : 'pass';
+      const issues = row.failureBucket ? [row.failureBucket, row.reason] : row.qualityCategories;
       const transcript: Transcript = {
-        id: `${scenario.name}-${idx + 1}-${randomUUID().slice(0, 8)}`,
+        id: `${scenario.name}-${idx + 1}-${randomUUID().slice(0,8)}`,
         scenarioId: scenario.name,
         scenarioCategory: scenario.tags?.[0] ?? scenario.name,
-        startedAt: row.result.startedAt,
         result: resultLabel,
         issues,
-        userTurns: 1,
-        botTurns: 1,
-        turns: [
-          { role: 'user', text: row.prompt, timestamp: row.result.startedAt },
-          { role: 'bot', text: row.answer, timestamp: new Date().toISOString(), latencyMs: row.result.latencyMs, result: resultLabel, issues },
-        ],
+        prompt: row.prompt,
+        answer: row.answer,
+        latencyMs: row.result.latencyMs,
+        status: row.result.status,
+        failureBucket: row.failureBucket ?? (row.qualityCategories.length ? 'chatbot_quality_failure' : null),
+        requestPayload: row.payload,
+        responseHeaders: row.result.headers,
+        rawResponse: row.result.rawBody,
+        parsedResponse: row.result.parsedBody,
+        error: row.result.error,
       };
       transcripts.push(transcript);
-      const refs = saveTranscriptArtifacts(config.outputDir, transcript);
-      pageRefs.push({ id: transcript.id, result: transcript.result, htmlPath: refs.htmlPath });
+      const htmlPath = saveTranscriptArtifacts(config.outputDir, transcript);
+      pages.push({ id: transcript.id, result: transcript.result, htmlPath });
 
       if (resultLabel !== 'pass') {
         appendJsonl(path.join(config.outputDir, 'failures.jsonl'), {
-          requestId: row.result.requestId,
-          scenario: row.result.scenario,
-          status: row.result.status,
-          latencyMs: row.result.latencyMs,
-          result: resultLabel,
-          categories: row.categories,
-          validation: row.validation,
-          salesSignals: row.salesSignals,
-          prompt: row.prompt,
-          answer: row.answer,
+          scenario: transcript.scenarioId,
+          result: transcript.result,
+          failureBucket: transcript.failureBucket,
+          reason: transcript.reason,
+          requestUrl: config.chatbotUrl,
+          requestPayload: transcript.requestPayload,
+          status: transcript.status,
+          responseHeaders: transcript.responseHeaders,
+          rawBody: transcript.rawResponse,
+          parsedBody: transcript.parsedResponse,
+          latencyMs: transcript.latencyMs,
+          error: transcript.error,
+          issues: transcript.issues,
         });
       }
     });
@@ -328,104 +386,77 @@ export async function runHarness(): Promise<void> {
     scenarioMetrics.push(computeScenarioMetrics(scenario.name, rows));
   }
 
+  // Conversation scenarios are still executed for stress continuity, but marked quality-only when usable answers exist
   const conversationMetrics: ConversationRunMetrics[] = [];
-  for (const conv of conversationScenarios) {
-    const run = await runConversationScenario(client, conv);
-    conversationMetrics.push(run);
-    const resultLabel: 'pass'|'warn'|'fail' = run.consistencyViolations > 0 || run.memoryFailures > 0 ? 'fail' : run.unstableRephraseCount > 0 || run.lateTurnLatencyGrowthRatio > 1.4 ? 'warn' : 'pass';
-    const issues = categorizeFailure({
-      validation: { parseFailure:false, emptyResponse:false, schemaDrift:false, keywordMiss:false, genericFailureDetected:false, suspiciousSignals:[], score: resultLabel === 'pass' ? 'pass' : resultLabel, knownFlakySemantic:false },
-      sales: { askedClarifyingQuestion:true, earlyRecommendation:false, hasCommercialCta:true, tooGeneric:false, potentialUnsafeFitment:false },
-      isTechnicalFailure: false,
-      contradiction: run.consistencyViolations > 0,
-      unstableRepeated: run.unstableRephraseCount > 0,
-      longContextDegradation: run.lateTurnLatencyGrowthRatio > 1.4,
-    });
-
-    const t: Transcript = {
-      id: `${conv.name}-${randomUUID().slice(0, 8)}`,
-      scenarioId: conv.name,
-      scenarioCategory: 'conversation',
-      startedAt: new Date().toISOString(),
-      result: resultLabel,
-      issues,
-      userTurns: conv.turns.length,
-      botTurns: conv.turns.length,
-      turns: conv.turns
-        .map((x) => ({ role: 'user' as const, text: x.userPrompt, timestamp: new Date().toISOString() }))
-        .flatMap((u, i) => [u, { role: 'bot' as const, text: `[captured in metrics]`, timestamp: new Date().toISOString(), latencyMs: run.turnLatenciesMs[i], result: resultLabel, issues }]),
-    };
-    transcripts.push(t);
-    const refs = saveTranscriptArtifacts(config.outputDir, t);
-    pageRefs.push({ id: t.id, result: t.result, htmlPath: refs.htmlPath });
-  }
+  for (const conv of conversationScenarios) conversationMetrics.push(await runConversationScenario(client, conv));
 
   const breakpoint = config.profile === 'breakpoint'
     ? await runBreakpointSearch(config)
     : { steps: [], bestStableConcurrency: 0, firstUnstableConcurrency: null };
 
   const summary = aggregateSummary(scenarioMetrics);
-  const total = Math.max(1, allRows.length);
-  const purchaseRows = allRows.filter((r) => r.result.scenario.includes('purchase') || r.prompt.toLowerCase().includes('buy'));
-  const fitmentRows = allRows.filter((r) => r.result.scenario.includes('fitment'));
+  const totalRows = Math.max(1, allRows.length);
+  const validRows = allRows.filter((r) => r.hasUsableAnswer);
+  const purchaseRows = validRows.filter((r) => r.result.scenario.includes('purchase') || r.prompt.toLowerCase().includes('buy'));
+  const fitmentRows = validRows.filter((r) => r.result.scenario.includes('fitment'));
 
   const salesMetrics = {
     conversationCompletionRate: conversationMetrics.length ? conversationMetrics.reduce((a,b)=>a+b.completionRate,0)/conversationMetrics.length : 0,
     contradictionRate: conversationMetrics.length ? conversationMetrics.reduce((a,b)=>a+b.consistencyViolations,0)/Math.max(1,conversationMetrics.reduce((a,b)=>a+b.totalTurns,0)) : 0,
     fitmentClarificationRate: fitmentRows.length ? fitmentRows.filter((r)=>r.salesSignals.askedClarifyingQuestion).length/fitmentRows.length : 0,
     purchaseGuidanceRate: purchaseRows.length ? purchaseRows.filter((r)=>r.salesSignals.hasCommercialCta || !r.salesSignals.tooGeneric).length/purchaseRows.length : 0,
-    ctaPresenceRate: allRows.filter((r)=>r.salesSignals.hasCommercialCta).length/total,
-    earlyRecommendationRate: allRows.filter((r)=>r.salesSignals.earlyRecommendation).length/total,
-    unsafeFitmentRate: allRows.filter((r)=>r.salesSignals.potentialUnsafeFitment).length/total,
-    suspiciousResponseRate: allRows.filter((r)=>!!r.validation.suspiciousReason).length/total,
-    noCtaRate: allRows.filter((r)=>!r.salesSignals.hasCommercialCta).length/total,
+    ctaPresenceRate: validRows.length ? validRows.filter((r)=>r.salesSignals.hasCommercialCta).length/validRows.length : 0,
+    noCtaRate: validRows.length ? validRows.filter((r)=>!r.salesSignals.hasCommercialCta).length/validRows.length : 0,
+    earlyRecommendationRate: validRows.length ? validRows.filter((r)=>r.salesSignals.earlyRecommendation).length/validRows.length : 0,
+    unsafeFitmentRate: validRows.length ? validRows.filter((r)=>r.salesSignals.potentialUnsafeFitment).length/validRows.length : 0,
+    suspiciousResponseRate: allRows.filter((r)=>!!r.validation.suspiciousReason).length/totalRows,
   };
 
-  const categoryCounter = new Map<string, number>();
-  transcripts.forEach((t) => t.issues.forEach((c) => categoryCounter.set(c, (categoryCounter.get(c) ?? 0) + 1)));
-  const topCategories = [...categoryCounter.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10);
-  const topFailScenarios = [...scenarioMetrics].sort((a,b)=>b.failures-a.failures).slice(0,10);
+  const shotResult = await captureScreenshots(config.outputDir, pages);
+  if (shotResult.failed > 0) {
+    transcripts.push({ id: `renderer-${randomUUID().slice(0,8)}`, scenarioId: 'renderer', scenarioCategory: 'system', result: 'warn', issues: ['screenshot_generation_failure'], prompt: '', answer: '', latencyMs: 0, failureBucket: 'screenshot_generation_failure', requestPayload: {}, reason: `${shotResult.failed} screenshot(s) failed` });
+  }
 
-  const screenshots = await captureScreenshots(config.outputDir, pageRefs);
+  const bucketCounts: Record<string, number> = {};
+  transcripts.forEach((t) => {
+    if (t.failureBucket) bucketCounts[t.failureBucket] = (bucketCounts[t.failureBucket] ?? 0) + 1;
+  });
 
-  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, salesMetrics, breakpoint, screenshots: screenshots.length });
+  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, salesMetrics, breakpoint, technicalBucketCounts: bucketCounts, screenshots: shotResult.files.length });
   writeJson(path.join(config.outputDir, 'scenario-metrics.json'), scenarioMetrics);
-  writeJson(path.join(config.outputDir, 'conversation-metrics.json'), conversationMetrics);
   writeJson(path.join(config.outputDir, 'sales-metrics.json'), salesMetrics);
+  writeJson(path.join(config.outputDir, 'conversation-metrics.json'), conversationMetrics);
   writeCsv(config.outputDir, scenarioMetrics);
 
-  buildMainReport(config.outputDir, summary, scenarioMetrics, salesMetrics, topCategories, topFailScenarios, transcripts, screenshots);
+  buildTechnicalReport(config.outputDir, transcripts.filter((t) => t.failureBucket && t.failureBucket !== 'chatbot_quality_failure'), bucketCounts);
+  buildMainReport(config.outputDir, summary, scenarioMetrics, salesMetrics, transcripts, shotResult.files, bucketCounts);
 
-  const suspiciousTop = allRows.filter((r) => !!r.validation.suspiciousReason).slice(0,10).map((r) => ({ scenario:r.result.scenario, answer:r.answer.slice(0,200), reason:r.validation.suspiciousReason }));
-  const ineffectiveTop = allRows.filter((r)=>!r.salesSignals.hasCommercialCta || r.salesSignals.tooGeneric).slice(0,10).map((r)=>({scenario:r.result.scenario,prompt:r.prompt.slice(0,120),answer:r.answer.slice(0,160)}));
-  writeJson(path.join(config.outputDir, 'top-10-worst-conversations.json'), transcripts.filter((t)=>t.result!=='pass').slice(0,10));
-  writeJson(path.join(config.outputDir, 'top-10-suspicious-answers.json'), suspiciousTop);
-  writeJson(path.join(config.outputDir, 'top-10-commercially-ineffective.json'), ineffectiveTop);
+  const topWorst = transcripts.filter((t)=>t.result!=='pass').slice(0,10);
+  const topSuspicious = allRows.filter((r)=>!!r.validation.suspiciousReason).slice(0,10).map((r)=>({scenario:r.result.scenario, reason:r.validation.suspiciousReason, answer:r.answer.slice(0,200)}));
+  const topIneffective = validRows.filter((r)=>!r.salesSignals.hasCommercialCta || r.salesSignals.tooGeneric).slice(0,10).map((r)=>({scenario:r.result.scenario,prompt:r.prompt.slice(0,120)}));
+  writeJson(path.join(config.outputDir, 'top-10-worst-conversations.json'), topWorst);
+  writeJson(path.join(config.outputDir, 'top-10-suspicious-answers.json'), topSuspicious);
+  writeJson(path.join(config.outputDir, 'top-10-commercially-ineffective.json'), topIneffective);
 
-  const jobSummaryLines = [
+  const technicalDominant = (bucketCounts.endpoint_unreachable ?? 0) + (bucketCounts.dns_or_network_failure ?? 0) + (bucketCounts.non_200_http_response ?? 0) > (summary.totals.total * 0.5);
+  writeJobSummary(config.outputDir, [
     '# Chatbot Stress Investigation Summary',
-    '',
     `- Success rate: ${(summary.successRate*100).toFixed(2)}%`,
-    `- Warn count: ${summary.totals.warns}`,
-    `- Fail count: ${summary.totals.failures}`,
-    `- Fitment clarification rate: ${(salesMetrics.fitmentClarificationRate*100).toFixed(2)}%`,
-    `- Purchase guidance rate: ${(salesMetrics.purchaseGuidanceRate*100).toFixed(2)}%`,
-    `- CTA presence rate: ${(salesMetrics.ctaPresenceRate*100).toFixed(2)}%`,
+    `- Technical dominant failures: ${technicalDominant ? 'YES' : 'NO'}`,
+    `- Main report: report/index.html`,
+    `- Technical report: report/technical.html`,
     '',
-    '## Top 10 worst conversations',
-    ...transcripts.filter((t)=>t.result!=='pass').slice(0,10).map((t)=>`- ${t.id} (${t.result}) [${t.issues.join(', ')}]`),
-    '',
-    '## Top 10 most suspicious answers',
-    ...suspiciousTop.map((x)=>`- ${x.scenario}: ${x.reason}`),
-    '',
-    '## Top 10 commercially ineffective conversations',
-    ...ineffectiveTop.map((x)=>`- ${x.scenario}: missing CTA or too generic`),
-  ];
-  writeJobSummary(config.outputDir, jobSummaryLines);
+    '## First things to check',
+    '- endpoint URL mismatch',
+    '- missing auth header',
+    '- wrong request payload shape',
+    '- incorrect response field mapping',
+    '- environment/network issue',
+    '- self-hosted runner / internal DNS reachability problem',
+  ]);
 
   console.log('=== Chatbot Stress Summary ===');
   console.log(`Profile: ${config.profile}`);
   console.log(`Main report: ${path.join(config.outputDir, 'report/index.html')}`);
-  console.log(`Conversation pages: ${path.join(config.outputDir, 'conversations')}`);
-  console.log(`Screenshots: ${path.join(config.outputDir, 'screenshots')}`);
+  console.log(`Technical report: ${path.join(config.outputDir, 'report/technical.html')}`);
 }

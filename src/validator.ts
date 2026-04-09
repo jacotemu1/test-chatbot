@@ -30,6 +30,29 @@ function pickAnswer(parsedBody: unknown, answerPath?: string): string {
     const val = (parsedBody as Record<string, unknown>)[key];
     if (typeof val === 'string') return val;
   }
+
+  const nestedCandidates = [
+    ['data', 'answer'],
+    ['data', 'text'],
+    ['result', 'answer'],
+    ['result', 'text'],
+    ['message', 'content'],
+    ['choices', '0', 'message', 'content'],
+  ];
+  for (const path of nestedCandidates) {
+    let cursor: unknown = parsedBody;
+    for (const segment of path) {
+      if (Array.isArray(cursor) && /^\\d+$/.test(segment)) {
+        cursor = cursor[Number(segment)];
+      } else if (cursor && typeof cursor === 'object' && segment in cursor) {
+        cursor = (cursor as Record<string, unknown>)[segment];
+      } else {
+        cursor = undefined;
+        break;
+      }
+    }
+    if (typeof cursor === 'string' && cursor.trim()) return cursor;
+  }
   return '';
 }
 
