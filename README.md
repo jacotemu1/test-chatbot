@@ -138,6 +138,29 @@ Generated breakpoint artifacts:
 - `breakpoint-steps.json`
 - `breakpoint-summary.md` (human interpretation with healthy/degrading/unreliable zones)
 
+
+## Multi-turn conversation simulation
+The harness now runs realistic conversation sessions with persisted turn history (`user` + `assistant` context) to verify coherence across turns.
+
+Implemented conversation scenarios:
+- short coherent conversation
+- long conversation (12 turns)
+- follow-up questions dependent on earlier answers
+- correction scenario (detail changed mid-session)
+- trap scenario to test self-contradiction resistance
+
+Conversation metrics produced:
+- turn-level latency
+- conversation completion rate
+- consistency violations
+- memory failures
+- late-turn latency degradation
+- rephrase instability
+
+Conversation artifacts:
+- `conversation-metrics.json`
+- `conversation-summary.md`
+
 ## Stress profiles
 - `light` – quick signal
 - `medium` – balanced
@@ -165,6 +188,8 @@ Generated in `CHATBOT_OUTPUT_DIR` (default `reports/`):
 - `playwright-report.json`
 - `playwright-html/`
 - `report.html` (human-readable scenario table)
+- `conversation-metrics.json` (turn-level and session-level conversation metrics)
+- `conversation-summary.md` (human interpretation for conversation coherence/degradation)
 - `breakpoint-summary.json` (best stable / first unstable / thresholds)
 - `breakpoint-steps.json` (per-step metrics table source)
 - `breakpoint-summary.md` (human interpretation)

@@ -5,8 +5,16 @@ import { loadConfig } from './config';
 import { computeScenarioMetrics, EvaluatedResult } from './metrics';
 import { validateResult } from './validator';
 import { appendJsonl, ensureDir, writeJson } from './utils/fs';
-import { BreakpointStepMetrics, HarnessConfig, ScenarioDefinition, ScenarioMetrics } from './types';
+import {
+  BreakpointStepMetrics,
+  ConversationRunMetrics,
+  ConversationScenario,
+  HarnessConfig,
+  ScenarioDefinition,
+  ScenarioMetrics,
+} from './types';
 import { buildScenarios, profileOverrides } from '../scenarios';
+import { buildConversationScenarios } from '../scenarios/conversations';
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -96,6 +104,138 @@ function writeCsv(outputDir: string, metrics: ScenarioMetrics[]): void {
   fs.writeFileSync(path.join(outputDir, 'scenario-metrics.csv'), [header, ...rows].join('\n'), 'utf8');
 }
 
+function normalize(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function hasKeyword(text: string, keywords: string[]): boolean {
+  const lower = text.toLowerCase();
+  return keywords.some((k) => lower.includes(k.toLowerCase()));
+}
+
+function runConversationMetrics(scenario: ConversationScenario, turns: Array<{ turnId: string; answer: string; latencyMs: number; ok: boolean }>): ConversationRunMetrics {
+  const byTurn = new Map(turns.map((t) => [t.turnId, t]));
+  let consistencyViolations = 0;
+  let memoryFailures = 0;
+  let unstableRephraseCount = 0;
+
+  const rephraseBuckets = new Map<string, string[]>();
+  for (const scriptedTurn of scenario.turns) {
+    const observed = byTurn.get(scriptedTurn.id);
+    if (!observed) continue;
+
+    if (scriptedTurn.expectKeywords && scriptedTurn.expectKeywords.length > 0) {
+      if (!hasKeyword(observed.answer, scriptedTurn.expectKeywords)) {
+        memoryFailures += 1;
+      }
+    }
+
+    if (scriptedTurn.memoryCheckForTurnId) {
+      const referenced = byTurn.get(scriptedTurn.memoryCheckForTurnId);
+      if (referenced && scriptedTurn.expectKeywords && !hasKeyword(observed.answer, scriptedTurn.expectKeywords)) {
+        memoryFailures += 1;
+      }
+    }
+
+    if (scriptedTurn.contradictionWithTurnId) {
+      const prior = byTurn.get(scriptedTurn.contradictionWithTurnId);
+      if (prior && normalize(prior.answer) === normalize(observed.answer)) {
+        consistencyViolations += 1;
+      }
+    }
+
+    if (scriptedTurn.rephraseGroup) {
+      const bucket = rephraseBuckets.get(scriptedTurn.rephraseGroup) ?? [];
+      bucket.push(normalize(observed.answer));
+      rephraseBuckets.set(scriptedTurn.rephraseGroup, bucket);
+    }
+  }
+
+  for (const answers of rephraseBuckets.values()) {
+    if (answers.length >= 2) {
+      const unique = new Set(answers);
+      if (unique.size === answers.length) unstableRephraseCount += 1;
+    }
+  }
+
+  const turnLatenciesMs = turns.map((t) => t.latencyMs);
+  const completedTurns = turns.filter((t) => t.ok).length;
+  const completionRate = scenario.turns.length ? completedTurns / scenario.turns.length : 0;
+  const avgTurnLatencyMs = turnLatenciesMs.length
+    ? turnLatenciesMs.reduce((a, b) => a + b, 0) / turnLatenciesMs.length
+    : 0;
+
+  const split = Math.max(1, Math.floor(turnLatenciesMs.length * 0.3));
+  const early = turnLatenciesMs.slice(0, split);
+  const late = turnLatenciesMs.slice(-split);
+  const earlyAvg = early.length ? early.reduce((a, b) => a + b, 0) / early.length : 1;
+  const lateAvg = late.length ? late.reduce((a, b) => a + b, 0) / late.length : earlyAvg;
+  const lateTurnLatencyGrowthRatio = earlyAvg > 0 ? lateAvg / earlyAvg : 1;
+
+  return {
+    scenario: scenario.name,
+    totalTurns: scenario.turns.length,
+    completedTurns,
+    completionRate,
+    turnLatenciesMs,
+    avgTurnLatencyMs,
+    lateTurnLatencyGrowthRatio,
+    consistencyViolations,
+    memoryFailures,
+    unstableRephraseCount,
+  };
+}
+
+async function runConversationScenario(client: ChatbotClient, scenario: ConversationScenario): Promise<ConversationRunMetrics> {
+  const history: Array<{ role: string; content: string }> = [];
+  const turns: Array<{ turnId: string; answer: string; latencyMs: number; ok: boolean }> = [];
+
+  for (const turn of scenario.turns) {
+    const result = await client.send({ input: turn.userPrompt, context: history }, `conversation-${scenario.name}`);
+    const validation = validateResult(result, { mode: 'consistency_check', expectedKeywords: turn.expectKeywords });
+    const answer = validation.answerText ?? result.rawBody ?? '';
+
+    turns.push({
+      turnId: turn.id,
+      answer,
+      latencyMs: result.latencyMs,
+      ok: !result.error && !result.timedOut && (result.status ?? 0) === 200 && validation.score !== 'fail',
+    });
+
+    history.push({ role: 'user', content: turn.userPrompt });
+    history.push({ role: 'assistant', content: answer || '[empty]' });
+  }
+
+  return runConversationMetrics(scenario, turns);
+}
+
+function writeConversationMarkdown(outputDir: string, items: ConversationRunMetrics[]): void {
+  const rows = items
+    .map((m) => `| ${m.scenario} | ${(m.completionRate * 100).toFixed(1)}% | ${m.avgTurnLatencyMs.toFixed(0)} | ${m.lateTurnLatencyGrowthRatio.toFixed(2)}x | ${m.consistencyViolations} | ${m.memoryFailures} | ${m.unstableRephraseCount} |`)
+    .join('\n');
+
+  const healthy = items.filter((m) => m.completionRate >= 0.95 && m.consistencyViolations === 0 && m.memoryFailures === 0);
+  const degrading = items.filter((m) => m.lateTurnLatencyGrowthRatio > 1.2 || m.unstableRephraseCount > 0);
+  const unreliable = items.filter((m) => m.completionRate < 0.9 || m.consistencyViolations > 0 || m.memoryFailures > 0);
+
+  const md = [
+    '# Conversation Session Summary',
+    '',
+    '## Interpretazione',
+    `- **Healthy**: ${healthy.map((x) => x.scenario).join(', ') || 'nessuno scenario chiaramente sano'}.`,
+    `- **Starts degrading**: ${degrading.map((x) => x.scenario).join(', ') || 'non rilevato'}.`,
+    `- **Unreliable**: ${unreliable.map((x) => x.scenario).join(', ') || 'non rilevato'}.`,
+    '',
+    '## Tabella metriche conversazionali',
+    '| Scenario | Completion rate | Avg turn latency (ms) | Late-turn growth | Consistency violations | Memory failures | Rephrase instability |',
+    '|---|---:|---:|---:|---:|---:|---:|',
+    rows,
+    '',
+  ].join('\n');
+
+  fs.writeFileSync(path.join(outputDir, 'conversation-summary.md'), md, 'utf8');
+}
+
 function evaluateBreakpointStep(metrics: ScenarioMetrics, concurrency: number, config: HarnessConfig): BreakpointStepMetrics {
   const total = Math.max(1, metrics.total);
   const timeoutRate = metrics.timeoutCount / total;
@@ -136,7 +276,6 @@ function evaluateBreakpointStep(metrics: ScenarioMetrics, concurrency: number, c
 function buildBreakpointMarkdown(steps: BreakpointStepMetrics[], bestStableConcurrency: number, firstUnstableConcurrency: number | null): string {
   const healthy = steps.filter((s) => s.healthy);
   const degrading = steps.filter((s) => !s.healthy && s.violations.length <= 2);
-  const unreliable = steps.filter((s) => !s.healthy && s.violations.length > 2);
 
   const rows = steps
     .map((s) => `| ${s.concurrency} | ${s.total} | ${s.p95LatencyMs} | ${(s.timeoutRate * 100).toFixed(2)}% | ${(s.errorRate * 100).toFixed(2)}% | ${(s.emptyResponseRate * 100).toFixed(2)}% | ${(s.schemaDriftRate * 100).toFixed(2)}% | ${s.healthy ? 'Healthy' : `Unstable: ${s.violations.join('; ')}`} |`)
@@ -174,11 +313,7 @@ function buildBreakpointMarkdown(steps: BreakpointStepMetrics[], bestStableConcu
   ].join('\n');
 }
 
-async function runBreakpointSearch(baseConfig: HarnessConfig): Promise<{
-  steps: BreakpointStepMetrics[];
-  bestStableConcurrency: number;
-  firstUnstableConcurrency: number | null;
-}> {
+async function runBreakpointSearch(baseConfig: HarnessConfig): Promise<{ steps: BreakpointStepMetrics[]; bestStableConcurrency: number; firstUnstableConcurrency: number | null; }> {
   const steps: BreakpointStepMetrics[] = [];
   const stepSize = Math.max(1, Math.floor(baseConfig.maxConcurrency / baseConfig.rampSteps));
   let bestStableConcurrency = 0;
@@ -222,6 +357,7 @@ export async function runHarness(): Promise<void> {
 
   const client = new ChatbotClient(config);
   const scenarios = buildScenarios(config);
+  const conversationScenarios = buildConversationScenarios();
 
   const metrics: ScenarioMetrics[] = [];
 
@@ -245,8 +381,13 @@ export async function runHarness(): Promise<void> {
         });
       }
     }
-
     metrics.push(computeScenarioMetrics(scenario.name, rows));
+  }
+
+  const conversationMetrics: ConversationRunMetrics[] = [];
+  for (const convScenario of conversationScenarios) {
+    const run = await runConversationScenario(client, convScenario);
+    conversationMetrics.push(run);
   }
 
   const breakpoint = config.profile === 'breakpoint'
@@ -258,10 +399,12 @@ export async function runHarness(): Promise<void> {
     ? buildBreakpointMarkdown(breakpoint.steps, breakpoint.bestStableConcurrency, breakpoint.firstUnstableConcurrency)
     : '';
 
-  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, breakpoint });
+  writeJson(path.join(config.outputDir, 'summary.json'), { ...summary, conversationScenarios: conversationMetrics.length, breakpoint });
   writeJson(path.join(config.outputDir, 'scenario-metrics.json'), metrics);
+  writeJson(path.join(config.outputDir, 'conversation-metrics.json'), conversationMetrics);
   writeCsv(config.outputDir, metrics);
   writeHumanHtml(config.outputDir, summary, metrics);
+  writeConversationMarkdown(config.outputDir, conversationMetrics);
 
   if (breakpoint.steps.length) {
     writeJson(path.join(config.outputDir, 'breakpoint-summary.json'), breakpoint);
@@ -277,6 +420,7 @@ export async function runHarness(): Promise<void> {
   console.log(`Hard failures: ${summary.totals.failures}`);
   console.log(`Timeouts: ${summary.totals.timeouts}`);
   console.log(`Non-200: ${summary.totals.non200}`);
+  console.log(`Conversation scenarios: ${conversationMetrics.length}`);
 
   if (breakpoint.steps.length) {
     console.log('=== Breakpoint Discovery ===');

@@ -94,6 +94,34 @@ export interface ScenarioDefinition {
   tags?: string[];
 }
 
+export interface ConversationTurn {
+  id: string;
+  userPrompt: string;
+  expectKeywords?: string[];
+  contradictionWithTurnId?: string;
+  memoryCheckForTurnId?: string;
+  rephraseGroup?: string;
+}
+
+export interface ConversationScenario {
+  name: string;
+  description: string;
+  turns: ConversationTurn[];
+}
+
+export interface ConversationRunMetrics {
+  scenario: string;
+  totalTurns: number;
+  completedTurns: number;
+  completionRate: number;
+  turnLatenciesMs: number[];
+  avgTurnLatencyMs: number;
+  lateTurnLatencyGrowthRatio: number;
+  consistencyViolations: number;
+  memoryFailures: number;
+  unstableRephraseCount: number;
+}
+
 export interface ScenarioMetrics {
   name: string;
   total: number;
