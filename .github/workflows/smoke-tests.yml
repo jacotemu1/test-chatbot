@@ -45,6 +45,13 @@ jobs:
       - name: Run smoke harness
         run: npm test
 
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f reports/job-summary.md ]; then
+            cat reports/job-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4

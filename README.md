@@ -1,29 +1,29 @@
 # Pirelli Conversational Sales Chatbot Stress Harness
 
-Node.js + TypeScript + Playwright harness to stress-test an internal chatbot that must act like an expert tyre dealer and guide users toward click-to-buy.
+A pragmatic Node.js + TypeScript + Playwright project for stress-testing a Pirelli chatbot that should behave like an expert tyre dealer and drive users toward click-to-buy.
 
-## Internal endpoint
+## Target endpoint
 `POST http://agent-gateway-service-qlt.pcons-eks-dev.pirelli.internal/agent-gateway/v1/chat`
 
-> Endpoint is internal: GitHub-hosted runners may not reach it. Prefer self-hosted runners on company network.
+> Internal endpoint: GitHub-hosted runners may not reach it. Use self-hosted runners on internal network when needed.
 
-## What this evaluates
-- technical reliability under load (latency, timeouts, errors, schema drift)
-- fitment-flow behavior (asks missing critical questions)
-- sales guidance quality (commercial next-step / CTA)
-- dealer-like conversation quality
-- robustness under confused/adversarial inputs
+## What this harness evaluates
+- technical reliability under stress (throughput, latency, timeout, non-200, parse/schema issues)
+- fitment-flow quality (asks missing critical questions before recommendations)
+- commercial effectiveness (next-step CTA, purchase progression)
+- dealer-like answer quality (not generic assistant behavior)
+- robustness under confused, adversarial, emotional, and contradictory inputs
 
 ## Scenario groups
-1. Purchase intent
-2. Fitment discovery
-3. Dealer-like conversation
-4. Stress mixed traffic
-5. Robustness/adversarial
+- purchase intent
+- fitment discovery
+- dealer-like conversation
+- stress mixed traffic
+- robustness
 
-Dataset: `fixtures/scenario-dataset.it.json` (Italian, 60+ prompts).
+Dataset: `fixtures/scenario-dataset.it.json` (English prompts, 60+ entries).
 
-## Quick start
+## Run locally
 ```bash
 npm ci
 npm test
@@ -37,28 +37,25 @@ npm run test:profile:heavy
 npm run test:profile:breakpoint
 ```
 
-## Key artifacts
+## Investigation artifacts
 Generated in `reports/`:
 - `summary.json`
-- `failures.jsonl`
 - `scenario-metrics.json`
-- `scenario-metrics.csv`
 - `sales-metrics.json`
 - `conversation-metrics.json`
-- `report.html`
-- `dashboard.html`
-- `executive-summary.md`
+- `failures.jsonl`
+- `report/index.html` (main executive investigation report)
+- `conversations/*.json|*.md|*.html` (full transcripts)
+- `screenshots/*.png` (failed/warn + sample pass rendered conversation pages)
+- `top-10-worst-conversations.json`
+- `top-10-suspicious-answers.json`
+- `top-10-commercially-ineffective.json`
+- `job-summary.md` (for GitHub Actions summary)
 - `junit.xml`
 
-## Executive summary output
-`executive-summary.md` states clearly:
-- where the bot is strong
-- where fitment journey fails
-- where commercial effectiveness drops
-- where technical stress degrades conversations
-- estimated safe operating range under concurrency
+## CI workflows
+- `smoke-tests.yml`
+- `stress-tests.yml`
+- `nightly.yml`
 
-## Workflows
-- `.github/workflows/smoke-tests.yml`
-- `.github/workflows/stress-tests.yml`
-- `.github/workflows/nightly.yml`
+All workflows upload artifacts and publish `reports/job-summary.md` to GitHub step summary when present.

@@ -1,10 +1,10 @@
 import { SalesSignals } from './types';
 
-const clarifyingPatterns = [/(misura|anno|modello|allestimento|chilometri|utilizzo|dimensione|larghezza)/i, /\?/];
-const recommendationPatterns = /(ti consiglio|raccomando|scelta migliore|miglior pneumatico|prendi questo)/i;
-const ctaPatterns = /(acquista|compra|aggiungi al carrello|clicca|prenota|procedi all'ordine|vai al checkout)/i;
-const genericPatterns = /(non so|dipende|consulta un esperto|non posso aiutarti|come posso aiutarti oggi)/i;
-const unsafeFitmentPatterns = /(va bene per qualsiasi auto|misura non importante|monta senza verifiche|non serve controllare)/i;
+const clarifyingPatterns = [/(size|year|model|trim|mileage|usage|load index|speed rating|vehicle)/i, /\?/];
+const recommendationPatterns = /(i recommend|best option|you should choose|go for|recommended tyre)/i;
+const ctaPatterns = /(buy now|checkout|add to cart|book fitting|next step|proceed to purchase|click to buy)/i;
+const genericPatterns = /(i am not sure|it depends only|consult an expert|cannot help|how can i help you today)/i;
+const unsafeFitmentPatterns = /(fits any car|size does not matter|install without checks|no need to verify fitment)/i;
 
 function containsAny(text: string, patterns: RegExp[]): boolean {
   return patterns.some((p) => p.test(text));
@@ -14,8 +14,8 @@ export function evaluateSalesSignals(userPrompt: string, answer: string): SalesS
   const promptLower = userPrompt.toLowerCase();
   const answerLower = answer.toLowerCase();
 
-  const needsFitmentClarification = /(auto|veicolo|misura|pneumatic|gomme|suv|berlina)/i.test(promptLower)
-    && !/(\d{3}\/\d{2}\s?r\d{2}|misura\s+\d)/i.test(promptLower);
+  const needsFitmentClarification = /(car|vehicle|tyre|tire|size|suv|hatchback|sedan)/i.test(promptLower)
+    && !/(\d{3}\/\d{2}\s?r\d{2}|\d{2,3}\s*\/\s*\d{2})/i.test(promptLower);
 
   const askedClarifyingQuestion = needsFitmentClarification && containsAny(answer, clarifyingPatterns);
   const hasCommercialCta = ctaPatterns.test(answerLower);
